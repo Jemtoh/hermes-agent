@@ -453,6 +453,28 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     state = _coerce_job_text(normalized.get("state")).strip()
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
+
+    # A one-shot that is firing RIGHT NOW still stores state="scheduled" —
+    # its run_claim is the only persisted evidence of the run, because
+    # last_run_at/last_status land (or the record is removed) only after
+    # delivery. Reading the stored state mid-run therefore looks identical
+    # to "never fired", which sent a live incident down the wrong path: a
+    # 16-minute run was diagnosed as a missed tick. Derive "running" for
+    # display when a fresh, unexpired claim is present. Read-path only —
+    # nothing persists this value, and the stored state machine is
+    # untouched.
+    claim = normalized.get("run_claim")
+    if state == "scheduled" and isinstance(claim, dict):
+        claimed_raw = _coerce_job_text(claim.get("at")).strip()
+        if claimed_raw:
+            try:
+                claimed_at = _ensure_aware(datetime.fromisoformat(claimed_raw))
+                age = (_hermes_now() - claimed_at).total_seconds()
+                if 0 <= age < _oneshot_run_claim_ttl_seconds():
+                    state = "running"
+            except (ValueError, TypeError):
+                pass  # malformed claim: keep the stored state
+
     normalized["state"] = state
 
     return normalized

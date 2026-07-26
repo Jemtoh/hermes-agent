@@ -2918,14 +2918,26 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         session_info["_first_nav"] = False
         _maybe_start_recording(nav_session_key)
 
+    # The cold-start timeout floor keys off "has an open ever SUCCEEDED in
+    # this session", not "is this the first attempt". _first_nav flips on
+    # the first attempt regardless of outcome, so when attempt #1 failed
+    # (daemon came up but the page timed out, then the daemon died), every
+    # retry was a cold Chromium+daemon start running on the 60s warm floor
+    # — observed 2026-07-26 in both a cron session (14:44, 14:45) and the
+    # main session (13:41): "browser 'open' timed out after 60s". Warmth is
+    # proven by success only, so retries after a failed open keep the full
+    # MIN_FIRST_OPEN_TIMEOUT budget.
+    daemon_warm = session_info.get("_daemon_warm", False)
+
     result = _run_browser_command(
         nav_session_key,
         "open",
         [url],
-        timeout=_get_open_command_timeout(first_open=is_first_nav),
+        timeout=_get_open_command_timeout(first_open=not daemon_warm),
     )
 
     if result.get("success"):
+        session_info["_daemon_warm"] = True
         data = result.get("data", {})
         title = data.get("title", "")
         final_url = data.get("url", url)

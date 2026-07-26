@@ -28,6 +28,57 @@ class TestOpenCommandTimeout:
         assert bt._get_open_command_timeout(first_open=False) == 180
 
 
+class TestColdStartBudgetSurvivesFailedOpen:
+    """The 120s cold-start floor keys off "has an open ever SUCCEEDED", not
+    "is this the first attempt". When attempt #1 failed (daemon up, page
+    timed out, daemon died), retries used to run cold Chromium starts on the
+    60s warm floor — observed 2026-07-26 in a cron session (14:44, 14:45)
+    and the main session (13:41)."""
+
+    def _navigate(self, session_info, mock_result):
+        import json
+        from tools.browser_tool import browser_navigate
+
+        with patch("tools.browser_tool._run_browser_command",
+                   return_value=mock_result) as mock_run, \
+             patch("tools.browser_tool._get_session_info",
+                   return_value=session_info), \
+             patch("tools.browser_tool._maybe_start_recording"), \
+             patch("tools.browser_tool._is_local_backend", return_value=True):
+            json.loads(browser_navigate("https://example.com"))
+        # The "open" is always the FIRST command; a successful navigate may
+        # issue follow-up commands afterwards.
+        return mock_run.call_args_list[0].kwargs.get("timeout")
+
+    def test_retry_after_failed_open_keeps_cold_budget(self, monkeypatch):
+        monkeypatch.setattr(bt, "_get_command_timeout", lambda: 30)
+        session = {"_first_nav": True}
+
+        failed = {"success": False, "error": "Operation timed out"}
+        t1 = self._navigate(session, failed)
+        assert t1 == bt.MIN_FIRST_OPEN_TIMEOUT
+
+        # _first_nav flipped, but no open has succeeded — the retry must
+        # still get the cold budget.
+        assert session["_first_nav"] is False
+        assert "_daemon_warm" not in session
+        t2 = self._navigate(session, failed)
+        assert t2 == bt.MIN_FIRST_OPEN_TIMEOUT
+
+    def test_successful_open_switches_to_warm_budget(self, monkeypatch):
+        monkeypatch.setattr(bt, "_get_command_timeout", lambda: 30)
+        session = {"_first_nav": True}
+
+        ok = {"success": True,
+              "data": {"title": "ok", "url": "https://example.com"}}
+        t1 = self._navigate(session, ok)
+        assert t1 == bt.MIN_FIRST_OPEN_TIMEOUT
+        assert session["_daemon_warm"] is True
+
+        t2 = self._navigate(session, ok)
+        assert t2 == bt.MIN_OPEN_TIMEOUT
+
+
 class TestSandboxBypass:
     def test_docker_triggers_bypass(self, monkeypatch):
         monkeypatch.setattr(bt, "_running_in_docker", lambda: True)

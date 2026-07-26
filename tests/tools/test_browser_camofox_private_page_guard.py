@@ -140,13 +140,15 @@ def test_camofox_click_still_runs_when_page_is_public(monkeypatch, _session):
 
     assert out["success"] is True
     assert out["clicked"] == "e1"
-    assert calls == [
-        (
-            "/tabs/tab-1/click",
-            {"userId": "user-1", "ref": "e1"},
-            None,
-        )
-    ]
+    # The subject here is the guard letting a public page through, so pin the
+    # path and body exactly; the timeout is the page-load budget (a click can
+    # navigate) and is asserted as a floor, not a literal, in
+    # test_browser_camofox_page_load_timeout.py.
+    assert len(calls) == 1
+    path, body, timeout = calls[0]
+    assert path == "/tabs/tab-1/click"
+    assert body == {"userId": "user-1", "ref": "e1"}
+    assert timeout >= 60
 
 
 def test_guard_inactive_does_not_probe(monkeypatch, _session):

@@ -396,11 +396,16 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
 
 
 def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
-    """Ensure a tab exists for the session, creating one if needed."""
+    """Ensure a tab exists for the session, creating one if needed.
+
+    Creating a tab ON a real URL loads that page, so it takes the page-load
+    budget; an empty ``about:blank`` tab is just a command.
+    """
     session = _get_session(task_id)
     if session["tab_id"]:
         return session
     base = get_camofox_url()
+    loads_page = bool(url) and url != "about:blank"
     resp = requests.post(
         f"{base}/tabs",
         json={
@@ -408,7 +413,7 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
             "listItemId": session["session_key"],
             "url": url,
         },
-        timeout=_get_command_timeout(),
+        timeout=_page_load_timeout() if loads_page else _get_command_timeout(),
         headers=_auth_headers(),
     )
     resp.raise_for_status()
@@ -444,6 +449,27 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
+
+# Some Camofox calls finish when the *site* does, not when the local
+# command returns: creating a tab on a real URL, navigating, and clicking
+# or pressing a key that triggers a page load. Budgeting those like
+# instant commands is what made the FIRST navigate to a heavy site
+# (Taobao behind its captcha) die at the 30s command timeout while a
+# second navigate to the same page succeeded on the explicit 60s budget —
+# the expensive call getting the cheap deadline, the same shape as the
+# agent-browser cold-start bug fixed in a628a4d.
+_PAGE_LOAD_TIMEOUT = 60
+
+
+def _page_load_timeout() -> int:
+    """Budget for a call that can include a page load.
+
+    Never shorter than the configured command timeout, so raising
+    ``browser.command_timeout`` raises this too rather than being
+    silently capped by the floor.
+    """
+    return max(_PAGE_LOAD_TIMEOUT, _get_command_timeout())
+
 
 def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
     """POST JSON to camofox and return parsed response."""
@@ -504,7 +530,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 data = _post(
                     f"/tabs/{session['tab_id']}/navigate",
                     {"userId": session["user_id"], "url": browser_url},
-                    timeout=60,
+                    timeout=_page_load_timeout(),
                 )
             except requests.HTTPError as e:
                 if e.response is not None and e.response.status_code == 404:
@@ -660,9 +686,12 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         # Strip @ prefix if present (our tool convention)
         clean_ref = ref.lstrip("@")
 
+        # A click can be a navigation (a product link, a search button), so
+        # it gets the page-load budget rather than the command budget.
         data = _post(
             f"/tabs/{session['tab_id']}/click",
             {"userId": session["user_id"], "ref": clean_ref},
+            timeout=_page_load_timeout(),
         )
         return json.dumps({
             "success": True,
@@ -757,9 +786,13 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
         if blocked:
             return blocked
 
+        # Enter in a search box is a navigation — and it is the documented
+        # workaround for sites whose sort/query params do not survive direct
+        # URL navigation, so this path matters more than it looks.
         _post(
             f"/tabs/{session['tab_id']}/press",
             {"userId": session["user_id"], "key": key},
+            timeout=_page_load_timeout(),
         )
         return json.dumps({"success": True, "pressed": key})
     except Exception as e:

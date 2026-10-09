@@ -1949,6 +1949,14 @@ def _deliver_result(
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
     if job.get("_artifact_delivery") and not for_failure:
+        # A restart-safe worker owns its execution row and must prepare BEFORE it enqueues;
+        # the gateway cannot prepare under its own PID and only adopts the stored anchor.
+        external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
+        if (external_execution and adapters is None
+                and external_execution == str(job.get("execution_id") or "")):
+            from cron.artifact_transport import enqueue_artifact_request
+
+            return enqueue_artifact_request(job, content)
         from cron.artifact_transport import deliver_artifact
 
         return deliver_artifact(job, adapters=adapters, loop=loop)

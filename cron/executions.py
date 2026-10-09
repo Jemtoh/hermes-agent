@@ -817,6 +817,60 @@ def reconcile_delivery_request(
     return receipt
 
 
+_PRE_DISPATCH_REFUSAL_REASONS = frozenset({
+    'artifact snapshot or path policy refused before dispatch',
+    'artifact request identity conflict before dispatch',
+    'artifact transport unavailable before dispatch',
+})
+
+
+def settle_undispatched_delivery_request(
+    execution_id: str, request_sha256: str, *, reason: str,
+) -> Optional[dict]:
+    """Settle a request proven NEVER dispatched: CAS ``unsent`` -> ``failed_certain``.
+
+    Distinct from :func:`settle_delivery_request`, which requires a claimed attempt nonce.
+    The queue sender revalidates the prepared request BEFORE the send claim, so a refusal
+    there is a proven no-send — but it still has to be durable, or its queue row could never
+    honestly read ``failed``. Only a code-owned refusal reason is accepted; an arbitrary
+    exception must never reach this state. ``None`` means another writer moved the anchor.
+    """
+    from cron.artifact_delivery import _hex
+
+    if reason not in _PRE_DISPATCH_REFUSAL_REASONS:
+        raise ValueError('failed_certain requires a proven pre-dispatch refusal')
+    _hex(request_sha256, 64)
+    with _transaction(immediate=True) as conn:
+        row = _fetch(conn, str(execution_id))
+        if not row or not row.get('delivery_receipt'):
+            return None
+        receipt = _decode_receipt(row)
+        if receipt['request_sha256'] != request_sha256:
+            raise ValueError('artifact request digest conflict')
+        if receipt['state'] != 'unsent' or receipt.get('attempt_nonce') or receipt.get('evidence'):
+            return None
+        receipt.update(state='failed_certain', reason=reason, settled_at=_hermes_now().isoformat())
+        changed = conn.execute(
+            'UPDATE executions SET delivery_receipt=?, delivery_outcome=? WHERE id=? AND delivery_receipt=?',
+            (json.dumps(receipt), _RECEIPT_OUTCOME['failed_certain'], row['id'], row['delivery_receipt'])).rowcount
+        if changed != 1:
+            return None
+        return receipt
+
+
+def execution_delivery_receipt(execution_id: str) -> Optional[dict]:
+    """Decoded durable receipt for one exact execution ID, or ``None`` — never mutates.
+
+    The queue needs this for an execution whose own payload has been redacted (its anchor is
+    gone); identity is then re-derived from the store, never from the queue row.
+    """
+    with _transaction() as conn:
+        row = _fetch(conn, str(execution_id))
+    if not row or not row.get('delivery_receipt'):
+        return None
+    return _decode_receipt(row)
+
+
 def get_artifact_delivery_receipt(token: str, purpose: str, *, expected_request_sha256=None) -> Optional[dict]:
     from cron.artifact_delivery import _hex
 

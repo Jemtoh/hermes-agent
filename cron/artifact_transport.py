@@ -278,6 +278,15 @@ def _install_late_callback(future, *, execution_id, request_sha256, attempt_nonc
             notification_result, artifact_results = done.result()
             _settle(execution_id, request_sha256, attempt_nonce, profile_sha256, message,
                     target, notification_result, artifact_results)
+            # Receipt FIRST: the queue row/tombstone is reconciled only from the durable
+            # receipt this attempt just wrote — never from the future's value here.
+            try:
+                from cron.delivery_queue import reconcile_late_delivery
+
+                reconcile_late_delivery(execution_id, request_sha256, attempt_nonce=attempt_nonce)
+            except Exception:
+                logger.warning("Artifact late queue reconciliation failed; receipt remains "
+                               "authoritative", exc_info=True)
         except Exception as exc:
             from cron.executions import settle_delivery_request
 
@@ -303,11 +312,15 @@ def _install_late_callback(future, *, execution_id, request_sha256, attempt_nonc
 def deliver_artifact(job: dict, *, adapters=None, loop=None):
     """Deliver an opted-in artifact request through the LIVE native adapter, or refuse.
 
+    A job carrying the prepared queue anchor is a gateway adoption and NEVER prepares a
+    replacement receipt under this process identity; a job without one is the direct sender.
     Returns ``None`` on success, else an explicit error string (never a silent success).
     """
     if not job.get("_artifact_delivery"):
         return "artifact delivery envelope missing; not sent"
     try:
+        if job.get("_artifact_anchor") is not None:
+            return _deliver_queued(job, adapters=adapters, loop=loop)
         return _deliver(job, job["_artifact_delivery"], adapters=adapters, loop=loop)
     except Exception as exc:
         logger.error("Job '%s': artifact delivery refused: %s", job.get("id", "?"), exc,
@@ -315,57 +328,56 @@ def deliver_artifact(job: dict, *, adapters=None, loop=None):
         return f"artifact delivery refused: {exc}"
 
 
-def _deliver(job: dict, envelope: dict, *, adapters, loop) -> Optional[str]:
-    from cron.executions import (
-        claim_delivery_request, settle_delivery_request,
-    )
+_PRE_DISPATCH_REFUSAL_REASON = "artifact snapshot or path policy refused before dispatch"
+_IDENTITY_REFUSAL_REASON = "artifact request identity conflict before dispatch"
+_TRANSPORT_REFUSAL_REASON = "artifact transport unavailable before dispatch"
+
+
+class _TransportRefusal(Exception):
+    """A refusal raised BEFORE any byte leaves; carries its failed_certain reason code."""
+
+    def __init__(self, message, reason_code=None):
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+def _target_transport(job, adapters):
+    """The single authorized native Telegram transport for this job, or ``_TransportRefusal``."""
     from gateway.config import Platform
     from gateway.delivery import resolve_delivery_transport
 
-    execution_id = str(job.get("execution_id") or "")
-    if not execution_id:
-        return "artifact delivery requires an owned execution attempt; not sent"
-    if adapters is None or loop is None or not getattr(loop, "is_running", lambda: False)():
-        # Queue integration is a separate task: fail closed rather than replay unproven.
-        return ("artifact delivery requires a live gateway adapter; queued artifact "
-                "delivery is not activated; not sent")
     targets = _targets(job)
     if len(targets) != 1 or str(targets[0].get("platform", "")).lower() != "telegram":
-        return "artifact delivery requires exactly one authorized Telegram target; not sent"
-
+        raise _TransportRefusal(
+            "artifact delivery requires exactly one authorized Telegram target; not sent")
     from gateway.config import load_gateway_config
 
     config = load_gateway_config()
-    target = targets[0]
     transport = resolve_delivery_transport(Platform.TELEGRAM, config, adapters)
     if transport is None or transport.is_relay:
-        return ("artifact delivery requires a live native Telegram transport "
-                "(relay cannot carry a byte snapshot); not sent")
+        raise _TransportRefusal(
+            "artifact delivery requires a live native Telegram transport "
+            "(relay cannot carry a byte snapshot); not sent",
+            reason_code=_TRANSPORT_REFUSAL_REASON)
+    return targets[0], transport, config
 
+
+def _claim_and_dispatch(job, envelope, target, snapshots, execution_id, request_sha256,
+                        attempt_nonce, profile_sha256, expected_target, transport, config, loop):
+    """Shared tail: dispatch once on the live loop, then settle or fence on timeout."""
+    from cron.executions import settle_delivery_request
     from cron.scheduler_provider import _profile_cron_scope
     from hermes_constants import get_hermes_home
 
     owning_home = get_hermes_home()
-    envelope, target, snapshots, receipt = prepare_artifact_request(job)
-    expected_target = receipt["request"]["target"]
-    if receipt["execution_id"] != execution_id:
-        return ("artifact request already claimed or settled; not resent "
-                f"(state={receipt['state']}, execution={receipt['execution_id']})")
-    claimed = claim_delivery_request(execution_id, receipt["request_sha256"])
-    if claimed is None:
-        return ("artifact request already claimed or settled; not resent "
-                f"(state={receipt.get('state')})")
-    attempt_nonce = claimed["attempt_nonce"]
-    profile_sha256 = claimed.get("sender_profile_sha256")
-
     from agent.async_utils import safe_schedule_threadsafe
 
     coro = _dispatch(transport, config, target["chat_id"], target.get("thread_id"),
                      envelope["message"], snapshots, _metadata(job))
     future = safe_schedule_threadsafe(coro, loop)
     if future is None:
-        settle_delivery_request(execution_id, receipt["request_sha256"],
-                                attempt_nonce=attempt_nonce, state="failed_certain",
+        settle_delivery_request(execution_id, request_sha256, attempt_nonce=attempt_nonce,
+                                state="failed_certain",
                                 reason="gateway loop unavailable before dispatch",
                                 profile_sha256=profile_sha256)
         return "artifact delivery could not reach the gateway loop; not sent"
@@ -375,22 +387,156 @@ def _deliver(job: dict, envelope: dict, *, adapters, loop) -> Optional[str]:
         # Keep the future ALIVE: the send may still land. The callback records the outcome.
         with _profile_cron_scope(owning_home):
             _install_late_callback(
-                future, execution_id=execution_id, request_sha256=receipt["request_sha256"],
-            attempt_nonce=attempt_nonce, profile_sha256=profile_sha256,
-            message=envelope["message"], target=expected_target)
+                future, execution_id=execution_id, request_sha256=request_sha256,
+                attempt_nonce=attempt_nonce, profile_sha256=profile_sha256,
+                message=envelope["message"], target=expected_target)
         return ("artifact delivery to telegram is unverified (timed out in flight); "
                 "completion recorded when it lands; do not resend")
     except Exception:
         logger.warning("Artifact dispatch failed in flight; no resend", exc_info=True)
-        settle_delivery_request(execution_id, receipt["request_sha256"], attempt_nonce=attempt_nonce,
+        settle_delivery_request(execution_id, request_sha256, attempt_nonce=attempt_nonce,
                                 state="unknown", reason="provider dispatch failed in flight",
                                 profile_sha256=profile_sha256)
         return "artifact delivery unverified: provider dispatch failed; do not resend"
-    ok, reason = _settle(execution_id, receipt["request_sha256"], attempt_nonce, profile_sha256,
+    ok, reason = _settle(execution_id, request_sha256, attempt_nonce, profile_sha256,
                          envelope["message"], expected_target, notification_result, artifact_results)
     if reason == "delivery suppressed; no provider send":
         return "artifact delivery suppressed; not sent"
     return None if ok else f"artifact delivery unverified: {reason}"
+
+
+def enqueue_artifact_request(job: dict, content: str) -> Optional[str]:
+    """Worker side of the queue handoff: prepare under the ACTIVE owned execution, then enqueue.
+
+    Preparation runs while this process still owns its ``running`` execution row; the gateway
+    cannot do it (its PID owns nothing). Only canonical identity/path metadata is serialized —
+    the captured byte snapshots stay in this process and are never written to ``job_json``.
+    """
+    from cron.delivery_queue import enqueue_and_wait, get_status
+
+    execution_id = str(job.get("execution_id") or "")
+    try:
+        _envelope, _target, _snapshots, receipt = prepare_artifact_request(job)
+    except Exception as exc:
+        logger.error("Job '%s': artifact preparation refused: %s", job.get("id", "?"), exc,
+                     exc_info=True)
+        return f"artifact delivery refused: {exc}"
+    if receipt["execution_id"] != execution_id:
+        return ("artifact request already claimed or settled; not enqueued "
+                f"(state={receipt['state']}, execution={receipt['execution_id']})")
+    job["_artifact_anchor"] = {
+        "execution_id": receipt["execution_id"], "job_id": str(job.get("id") or ""),
+        "request_sha256": receipt["request_sha256"], "request": receipt["request"],
+    }
+    error = enqueue_and_wait(execution_id, job, content)
+    status = get_status(execution_id)
+    if status and status["status"] == "suppressed":
+        job["_notification_all_targets_suppressed"] = True
+    return error
+
+
+def _deliver_queued(job: dict, *, adapters, loop) -> Optional[str]:
+    """Gateway side of the queue handoff: revalidate the STORED anchor, capture, claim, send.
+
+    The gateway revalidates the carried envelope and re-reads every artifact path policy into
+    immutable byte snapshots BEFORE the ``unsent -> sending`` claim. It never prepares a
+    replacement receipt: the worker's durable anchor is the only authority.
+    """
+    from cron.artifact_delivery import validate_envelope
+    from cron.executions import (
+        _delivery_identity, claim_delivery_request, reconcile_delivery_request,
+        settle_undispatched_delivery_request,
+    )
+
+    anchor = job.get("_artifact_anchor") or {}
+    execution_id = str(anchor.get("execution_id") or "")
+    request_sha256 = str(anchor.get("request_sha256") or "")
+    job_id = str(anchor.get("job_id") or "")
+    if not execution_id or not request_sha256 or not job_id:
+        return "queued artifact delivery requires the prepared request anchor; not sent"
+    if str(job.get("execution_id") or "") != execution_id or str(job.get("id") or "") != job_id:
+        return "queued artifact delivery anchor does not match this job; not sent"
+    if adapters is None or loop is None or not getattr(loop, "is_running", lambda: False)():
+        return ("artifact delivery requires a live gateway adapter; "
+                "queued artifact delivery is not activated; not sent")
+
+    def _refused(reason, *, reason_code=None):
+        if reason_code is not None:
+            try:
+                settle_undispatched_delivery_request(execution_id, request_sha256, reason=reason_code)
+            except Exception:
+                logger.warning("Artifact pre-dispatch refusal could not settle; no send was made",
+                               exc_info=True)
+        return reason
+
+    try:
+        target, transport, config = _target_transport(job, adapters)
+    except _TransportRefusal as exc:
+        return _refused(str(exc), reason_code=exc.reason_code)
+
+    try:
+        envelope = validate_envelope(json.loads(json.dumps(job["_artifact_delivery"])),
+                                     verify_files=False)
+        snapshots = snapshot_request(envelope)
+    except (ValueError, TypeError, KeyError, OSError) as exc:
+        return _refused(f"artifact delivery refused before dispatch: {exc}",
+                        reason_code=_PRE_DISPATCH_REFUSAL_REASON)
+    try:
+        rebuilt = build_request_identity(envelope, target, snapshots)
+        _key, digest = _delivery_identity(rebuilt)
+    except (ValueError, TypeError, KeyError) as exc:
+        return _refused(f"artifact delivery refused before dispatch: {exc}",
+                        reason_code=_PRE_DISPATCH_REFUSAL_REASON)
+    if digest != request_sha256 or anchor.get("request") != rebuilt:
+        return _refused("artifact delivery identity conflict before dispatch",
+                        reason_code=_IDENTITY_REFUSAL_REASON)
+    try:
+        stored = reconcile_delivery_request(execution_id, request_sha256, job_id=job_id)
+    except ValueError as exc:
+        return f"artifact delivery anchor conflict: {exc}"
+    if stored is None:
+        return "artifact request anchor is missing; not sent"
+    if stored.get("request") != rebuilt:
+        return _refused("artifact delivery request conflict before dispatch",
+                        reason_code=_IDENTITY_REFUSAL_REASON)
+    if stored.get("state") != "unsent":
+        return f"artifact request already {stored.get('state')}; not resent"
+    claimed = claim_delivery_request(execution_id, request_sha256)
+    if claimed is None:
+        return f"artifact request already claimed or settled; not resent (state={stored.get('state')})"
+    return _claim_and_dispatch(
+        job, envelope, target, snapshots, execution_id, request_sha256,
+        claimed["attempt_nonce"], claimed.get("sender_profile_sha256"),
+        stored["request"]["target"], transport, config, loop)
+
+
+def _deliver(job: dict, envelope: dict, *, adapters, loop) -> Optional[str]:
+    from cron.executions import claim_delivery_request
+
+    execution_id = str(job.get("execution_id") or "")
+    if not execution_id:
+        return "artifact delivery requires an owned execution attempt; not sent"
+    if adapters is None or loop is None or not getattr(loop, "is_running", lambda: False)():
+        # Queue integration is a separate task: fail closed rather than replay unproven.
+        return ("artifact delivery requires a live gateway adapter; queued artifact "
+                "delivery is not activated; not sent")
+    try:
+        target, transport, config = _target_transport(job, adapters)
+    except _TransportRefusal as exc:
+        return str(exc)
+    envelope, target, snapshots, receipt = prepare_artifact_request(job)
+    expected_target = receipt["request"]["target"]
+    if receipt["execution_id"] != execution_id:
+        return ("artifact request already claimed or settled; not resent "
+                f"(state={receipt['state']}, execution={receipt['execution_id']})")
+    claimed = claim_delivery_request(execution_id, receipt["request_sha256"])
+    if claimed is None:
+        return ("artifact request already claimed or settled; not resent "
+                f"(state={receipt.get('state')})")
+    return _claim_and_dispatch(
+        job, envelope, target, snapshots, execution_id, receipt["request_sha256"],
+        claimed["attempt_nonce"], claimed.get("sender_profile_sha256"),
+        expected_target, transport, config, loop)
 
 
 def prepare_artifact_request(job: dict) -> tuple:

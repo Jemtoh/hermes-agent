@@ -336,3 +336,82 @@ activation, sends, source-policy or Sites-gate change is implied.
 A missing chunk ID after earlier accepted chunks preserves the adapter's partial-send
 metadata with no certain-unsent tail. Missing acceptance IDs are non-retryable;
 provider acceptance may already have occurred.
+
+## Actual queue implementation contracts (9 October 2026)
+
+Implementation status: queue support implemented and locally verified in an isolated execution
+worktree on `4f3a72c1b7`; NOT reviewed, NOT committed, NOT activated. There is still no live
+queue send. This section records the contracts as BUILT, from source, because three of them are
+corrections to the phrasing below.
+
+- **Private serialized anchor name: `job["_artifact_anchor"]`** — the agreed reference the queue
+  plan left open. It holds `{execution_id, job_id, request_sha256, request}` where `request` is
+  the canonical identity `build_request_identity` produced. It carries no message text, no local
+  path and no bytes, and it travels in the queue row's EXISTING `job_json` beside the already
+  carried `_artifact_delivery` envelope. No delivery-queue schema change was made.
+- **`artifact_transport.enqueue_artifact_request(job, content)`** — worker seam. It calls
+  `prepare_artifact_request(job)` while the worker still owns its `running` execution row, refuses
+  to enqueue when the returned receipt belongs to a different execution, mints the anchor, and
+  then calls `delivery_queue.enqueue_and_wait`. `scheduler_delivery._deliver_result` reaches it
+  only when `_HERMES_CRON_EXTERNAL_WORKER` matches the job's own `execution_id` and no adapter is
+  present; every other caller keeps the direct sender.
+- **`cron/delivery_queue.enqueue` adoption** validates an incoming anchor against the durable
+  receipt under the CURRENT home before any existing row or tombstone is adopted: the anchor's
+  canonical request must re-derive its own `request_sha256` (`executions._delivery_identity`),
+  the stored receipt request must equal it, and the carried envelope plus queued content must
+  restate its token/purpose/notification digest/ordered kind-digest-transport. A tombstone is
+  adopted only when the receipt-derived status is settled and the tombstone does not contradict
+  it; a refusal is returned as an error and is never inserted. Legacy jobs take the unchanged
+  path, including the original tombstone-then-row query order.
+- **Correction 1 — no `claim_next` preflight argument was needed.** Capture happens after queue
+  ownership but BEFORE the receipt `unsent -> sending` claim, which is what the contract
+  requires; `claim_next` still performs no filesystem read inside its SQLite transaction.
+- **`artifact_transport._deliver_queued`** is the gateway adoption. It re-runs
+  `validate_envelope(..., verify_files=False)`, re-resolves the single authorized Telegram target,
+  captures every artifact path policy into immutable snapshots, rebuilds the full identity and
+  compares its digest with the stored anchor, re-reads the stored receipt via
+  `executions.reconcile_delivery_request`, and only then calls the existing
+  `claim_delivery_request` CAS. It never calls `prepare_artifact_request`, and a receipt that is
+  not `unsent` is refused by name. A proven refusal BEFORE the claim settles the anchor through a
+  NEW guarded API.
+- **Correction 2 — the existing settler could not express a proven pre-dispatch no-send.**
+  `executions.settle_undispatched_delivery_request(execution_id, request_sha256, *, reason)`
+  CASes `unsent -> failed_certain` with no attempt nonce and accepts only three code-owned
+  reasons (`artifact snapshot or path policy refused before dispatch`, `artifact request
+  identity conflict before dispatch`, `artifact transport unavailable before dispatch`); an
+  arbitrary exception can never reach that state. `settle_delivery_request` is unchanged, so the
+  existing gateway-loop refusal path and its tests still hold.
+- **Queue terminal disposition is receipt-derived.** `delivery_queue._finish` ignores the drain
+  callback's return value, its suppression flag and the legacy `last_delivery_unverified` marker
+  for any row carrying an anchor, and maps the receipt instead: verified -> delivered,
+  suppressed -> suppressed, failed_certain -> failed, anything else -> unknown. `drain`,
+  `recover_abandoned` and the wait timeout `_terminalize_wait_timeout` apply the same
+  receipt-derived outcome, and `get_status` reconciles on readback so a worker's poll sees a
+  settled receipt.
+- **Late completion reconciles RECEIPT-FIRST.** `artifact_transport._install_late_callback`
+  settles the receipt and only then calls `delivery_queue.reconcile_late_delivery(execution_id,
+  request_sha256, attempt_nonce=...)`, which requires a `verified` receipt whose
+  `sender_profile_sha256` matches the current profile and upgrades an `unknown`/`delivering` row
+  (same process owner) or an `unknown` tombstone. A wrong nonce, another profile, a
+  failed/suppressed receipt or a missing queue row all refuse — a direct-send callback
+  legitimately finds no queue row.
+- **Correction 3 — receipt-first crash recovery needed a store reader.** `_reconcile_artifact_rows`
+  runs at the top of `drain` and `delivery_queue._tombstone_settled` runs on readback; both use
+  the NEW `executions.execution_delivery_receipt(execution_id)` because a redacted row or pruned
+  tombstone no longer carries the anchor. Only a settled receipt may terminalize a row, so a row
+  whose send is genuinely in flight is never touched.
+
+Honest limitations of this implementation: a queue payload that does not carry an anchor (a
+legacy-shaped row) can never be reconciled from the receipt alone — only rows written by this
+feature do; notification proof stays bounded to 64 chunks; the worker's enqueue waits at most
+`DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS` and a pending row is deferred to the next gateway rather
+than failed; and receipt-bearing rows still retain small identity metadata indefinitely under the
+approved retention contract.
+
+Verification actually run (isolated worktree, fakes and temp SQLite only): the new
+`tests/cron/test_artifact_queue_integration.py` is 2 passed / 19 failed against the pre-change
+code and 21 passed after it; the artifact/queue target suites are 132 passed, 0 failed; and
+`tests/cron` plus the Telegram receipt/native/chunk/rich/profile callers is 178 files,
+1,803 passed, 0 failed, 12 skipped. `scripts/check` reports 11 checks ok with no new health
+waiver and no hook bypass. No live cache, vault, Notion, broker, provider, model, schedule or
+message was touched.

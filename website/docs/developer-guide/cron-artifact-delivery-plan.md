@@ -243,3 +243,38 @@ both at their actual send owners and test with fake provider responses before
 calling the opt-in transport capable. `_transaction` uses a normal connection
 context and does not begin IMMEDIATE itself; use the existing shared SQLite
 primitive deliberately, without double-BEGIN. This is still unactivated work.
+
+## Consumer API and dispatch-gap closure
+
+NEW supported readback API to implement in the execution owner:
+`get_artifact_delivery_receipt(token, purpose, *, expected_request_sha256=None)`.
+Resolve under the caller's owning profile; validate token/purpose and reject
+conflicting identity before returning decoded canonical metadata/status/evidence.
+Return None only for no matching request, never as success. Consumers inject a
+fake reader in tests. This is an extension contract, not an existing hook.
+
+A worker may die between durable request preparation and queue insertion.
+Reconciliation must not strand its `unsent` request forever: in BEGIN IMMEDIATE,
+prove the owning execution PID/start-time is dead using the existing fail-safe
+owner check, confirm state unsent with no attempt nonce or any chunk/file receipt,
+then CAS unsent -> failed_certain with reason “owner exited before dispatch.”
+Preserve that old receipt row. The partial unique index now permits a new exact-
+identity claim on the next execution. Any live/unknown owner or sending/unknown
+attempt stays fenced. An old pending queue row may not dispatch after this CAS;
+its sender also CASes unsent -> sending against that exact anchor. Fake tests
+cover preparation/queue crash gap, racing gateway claim and PID reuse.
+
+For opted-in envelopes, explicit artifact metadata is the ONLY attachment source.
+Bypass inline MEDIA extraction and response wrapper/whitespace rewriting for the
+saved `message`; news/review prose containing MEDIA directives is literal text,
+never a new file instruction. Ordinary job media extraction stays unchanged.
+Preserve exact input bytes/digest before formatting; adapter receipts separately
+hash actual transformed chunks. Test embedded directives and trailing newlines.
+
+For opted-in envelopes, redact the saved notification through the existing cron
+redaction helper BEFORE computing and saving `message_sha256`; the parser refuses
+any message that would still change under that helper. Dispatch does not rewrite
+it again. Provider receipts distinguish that saved input digest from formatted
+chunk/payload digests. The full artifact remains separate private evidence under
+the existing media policy. A live or unverifiable owner is fenced until an
+operator resolves it; the dead-owner recovery does not reclaim a wedged live PID.

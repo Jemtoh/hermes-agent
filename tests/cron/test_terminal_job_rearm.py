@@ -64,7 +64,10 @@ def test_wedged_claimed_oneshot_remains_triggerable(tmp_cron_dir):
     save_jobs([record])
 
     triggered = trigger_job(job["id"])
-    assert triggered["state"] == "scheduled"
+    # A fresh claim still displays running; the new run-now request is stored as scheduled.
+    assert triggered["state"] == "running"
+    assert load_jobs()[0]["state"] == "scheduled"
+    assert triggered["manual_run_at"] == triggered["next_run_at"]
     assert triggered["enabled"] is True
 
 

@@ -323,11 +323,17 @@ def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """Write a terminal result once; terminal attempts cannot be rewritten."""
+    """Write a terminal result once; terminal attempts cannot be rewritten.
+
+    The receipt is reread INSIDE this transaction: a late provider proof that already
+    settled an opt-in request to ``verified`` outranks the outcome the caller computed
+    from the send call it saw time out, so a stale timeout cannot clobber it.
+    """
     now = _hermes_now().isoformat()
     status = "completed" if success else "failed"
     detail = None if success else (str(error) if error else "unknown failure")
-    with _transaction() as conn:
+    with _transaction(immediate=True) as conn:
+        delivery_outcome = _receipt_delivery_outcome(_fetch(conn, execution_id), delivery_outcome)
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
@@ -691,12 +697,150 @@ def claim_delivery_request(execution_id: str, request_sha256: str) -> Optional[d
             return None
         receipt.update(state='sending', attempt_nonce=uuid.uuid4().hex, sender_pid=os.getpid(),
                        sender_started_at=_process_start_time(os.getpid()),
-                       sender_profile_sha256=hashlib.sha256(str(get_hermes_home().resolve()).encode()).hexdigest())
+                       sender_profile_sha256=delivery_profile_sha256())
         changed = conn.execute('UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
                                (json.dumps(receipt), execution_id, row['delivery_receipt'])).rowcount
         if changed != 1:
             return None
         return receipt
+
+
+_DELIVERY_SETTLED_STATES = ('verified', 'unknown', 'failed_certain', 'suppressed')
+# Receipt state -> delivery_outcome. In-flight states have no positive evidence yet.
+_RECEIPT_OUTCOME = {
+    'unsent': 'unknown', 'sending': 'unknown', 'unknown': 'unknown',
+    'verified': 'delivered', 'suppressed': 'suppressed', 'failed_certain': 'failed',
+}
+# Evidence stores IDs/hashes/targets and nothing else: a durable receipt must never
+# retain a report body, a local path or a credential.
+_EVIDENCE_BANNED_KEYS = frozenset({
+    'path', 'file', 'filepath', 'filename', 'bytes', 'body', 'message', 'content', 'text',
+    'token', 'secret', 'password', 'credential', 'key',
+})
+_EVIDENCE_MAX_FIELDS = 64
+_EVIDENCE_MAX_CHARS = 65536
+
+
+def _receipt_delivery_outcome(row, delivery_outcome):
+    """Receipt-derived disposition. A settled receipt is authoritative; an in-flight one
+    only fills a caller that had nothing to record."""
+    if not row or not row.get('delivery_receipt'):
+        return delivery_outcome
+    try:
+        receipt = _decode_receipt(row)
+    except ValueError:
+        return delivery_outcome
+    if receipt['state'] in ('unsent', 'sending'):
+        return delivery_outcome if delivery_outcome is not None else 'unknown'
+    return _RECEIPT_OUTCOME[receipt['state']]
+
+
+def _validate_delivery_evidence(value, depth=0) -> None:
+    """Reject evidence that could retain a body, a local path or a credential."""
+    if depth > 6 or isinstance(value, (str, bytes, bytearray)) and len(value) > 4096:
+        raise ValueError('invalid artifact evidence value')
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return
+    if isinstance(value, (list, tuple)):
+        if len(value) > _EVIDENCE_MAX_FIELDS:
+            raise ValueError('artifact evidence is unbounded')
+        for item in value:
+            _validate_delivery_evidence(item, depth + 1)
+        return
+    if isinstance(value, dict):
+        if len(value) > _EVIDENCE_MAX_FIELDS:
+            raise ValueError('artifact evidence is unbounded')
+        for field, item in value.items():
+            if not isinstance(field, str) or field.lower() in _EVIDENCE_BANNED_KEYS:
+                raise ValueError('artifact evidence must not retain bodies, paths or credentials')
+            _validate_delivery_evidence(item, depth + 1)
+        return
+    raise ValueError('invalid artifact evidence value')
+
+
+def _checked_evidence(evidence) -> Optional[dict]:
+    if evidence is None:
+        return None
+    if not isinstance(evidence, dict):
+        raise ValueError('artifact evidence must be a mapping')
+    _validate_delivery_evidence(evidence)
+    if len(json.dumps(evidence)) > _EVIDENCE_MAX_CHARS:
+        raise ValueError('artifact evidence is unbounded')
+    return evidence
+
+
+def delivery_profile_sha256() -> str:
+    """Stable identity of the profile whose execution store owns a receipt."""
+    return hashlib.sha256(str(get_hermes_home().resolve()).encode()).hexdigest()
+
+
+def settle_delivery_request(
+    execution_id: str, request_sha256: str, *, attempt_nonce: str, state: str,
+    evidence: Optional[dict] = None, reason: Optional[str] = None,
+    profile_sha256: Optional[str] = None,
+) -> Optional[dict]:
+    """Settle ONE claimed attempt to a terminal receipt state, exactly once.
+
+    CAS on the exact execution id, request digest and minted attempt nonce, under the
+    owning profile. ``None`` means another writer already settled it (or the anchor
+    moved) — never a licence to send again. A late provider proof uses the same call
+    with the attempt nonce captured at claim time.
+    """
+    from cron.artifact_delivery import _hex
+
+    if state not in _DELIVERY_SETTLED_STATES:
+        raise ValueError('invalid artifact receipt state')
+    if not isinstance(attempt_nonce, str) or not attempt_nonce:
+        raise ValueError('artifact settlement requires the claim attempt nonce')
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 300):
+        raise ValueError('invalid artifact settlement reason')
+    _hex(request_sha256, 64)
+    evidence = _checked_evidence(evidence)
+    with _transaction(immediate=True) as conn:
+        row = _fetch(conn, str(execution_id))
+        if not row or not row.get('delivery_receipt'):
+            raise ValueError('artifact request anchor is missing')
+        receipt = _decode_receipt(row)
+        if receipt['request_sha256'] != request_sha256:
+            raise ValueError('artifact request digest conflict')
+        if receipt['state'] != 'sending' or receipt.get('attempt_nonce') != attempt_nonce:
+            return None
+        if profile_sha256 is not None and receipt.get('sender_profile_sha256') != profile_sha256:
+            return None
+        receipt.update(state=state, settled_at=_hermes_now().isoformat())
+        if evidence is not None:
+            receipt['evidence'] = evidence
+        if reason is not None:
+            receipt['reason'] = reason
+        changed = conn.execute(
+            'UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
+            (json.dumps(receipt), row['id'], row['delivery_receipt'])).rowcount
+        if changed != 1:
+            return None
+        return receipt
+
+
+def reconcile_delivery_request(
+    execution_id: str, request_sha256: str, *, attempt_nonce: Optional[str] = None,
+) -> Optional[dict]:
+    """Reread the receipt for one exact attempt under the owning profile — never mutates.
+
+    A dead process leaves ``sending``; that is the honest answer, not success. Identity
+    conflict raises instead of returning another attempt's receipt.
+    """
+    from cron.artifact_delivery import _hex
+
+    _hex(request_sha256, 64)
+    with _transaction() as conn:
+        row = _fetch(conn, str(execution_id))
+    if not row or not row.get('delivery_receipt'):
+        return None
+    receipt = _decode_receipt(row)
+    if receipt['request_sha256'] != request_sha256:
+        raise ValueError('artifact request digest conflict')
+    if attempt_nonce is not None and receipt.get('attempt_nonce') != attempt_nonce:
+        raise ValueError('artifact attempt nonce conflict')
+    return receipt
 
 
 def get_artifact_delivery_receipt(token: str, purpose: str, *, expected_request_sha256=None) -> Optional[dict]:

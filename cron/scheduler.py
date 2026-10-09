@@ -515,6 +515,7 @@ from cron.jobs import (
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
 from cron import store_health
+from cron.consumer_run_lock import consumer_run_guard, reject_recursive_consumer_run
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
@@ -2778,9 +2779,8 @@ def run_one_job(
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
-    # Every gateway path (built-in scheduler, external providers, and direct
-    # API fires) crosses this seam.  Ensure the detached worker has a durable
-    # attempt to adopt before any launch can occur.
+    reject_recursive_consumer_run(job)
+    # Give every producer a durable attempt before worker handoff.
     if not job.get("execution_id"):
         execution = create_execution(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
@@ -2854,17 +2854,14 @@ def run_one_job(
             fire_owner or None, profile_home)
     try:
         with self_removal_delivery_scope(job["id"]):
-            return _run_with_fire_claim_heartbeat(
-                job,
-                lambda lost_ownership: _run_one_job_body(
-                    job,
-                    adapters=adapters,
-                    loop=loop,
-                    verbose=verbose,
-                    extra_prompt=extra_prompt,
-                    claim_lost=lost_ownership,
-                    transport_cancel=cancel_event,
-                    execution_token=execution_token))
+            with consumer_run_guard(job, execution_id) as may_run:
+                if not may_run:
+                    return True
+                return _run_with_fire_claim_heartbeat(
+                    job, lambda lost_ownership: _run_one_job_body(
+                        job, adapters=adapters, loop=loop, verbose=verbose,
+                        extra_prompt=extra_prompt, claim_lost=lost_ownership,
+                        transport_cancel=cancel_event, execution_token=execution_token))
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(_fire_key)

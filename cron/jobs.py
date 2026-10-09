@@ -2,6 +2,9 @@
 """Cron job storage: ~/.hermes/cron/jobs.json; output in
 ~/.hermes/cron/output/{job_id}/{timestamp}.md"""
 
+from cron.job_fields import _normalize_job_optional_text, _normalize_reasoning_effort
+from cron.consumer_run_lock import release_unstarted_fire
+
 import contextlib
 import copy
 from contextvars import ContextVar
@@ -1685,14 +1688,6 @@ def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
     return (provider.lower() if provider else None), model
 
 
-def _normalize_job_optional_text(
-    value: Any, *, strip_trailing_slash: bool = False
-) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    return (value.strip().rstrip("/") if strip_trailing_slash else value.strip()) or None
-
-
 def _normalize_base_url(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value, strip_trailing_slash=True)
 
@@ -1729,27 +1724,6 @@ def _normalize_failure_deliver(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value)
 
 
-def _normalize_reasoning_effort(value: Any) -> Optional[str]:
-    """Spelling-only validation via the shared parser (cron knob never stricter/looser than
-    config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
-    transports clamp at send time). None for unset, lowercase level, or ValueError."""
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if not text:
-        return None
-    from hermes_constants import parse_reasoning_effort
-
-    if parse_reasoning_effort(text) is None:
-        raise ValueError(
-            f"Invalid reasoning_effort {value!r}. Valid levels: "
-            "none, minimal, low, medium, high, xhigh, max, ultra "
-            "(empty string clears the override).")
-    if text in {"false", "disabled"}:
-        return "none"
-    return text
-
-
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
@@ -1765,6 +1739,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
     "interpreter": _normalize_job_optional_text,
+    "run_lock": _normalize_job_optional_text,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1774,6 +1749,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
+    "run_lock": _normalize_job_optional_text,
 }
 
 
@@ -1845,6 +1821,7 @@ def create_job(
     paused_reason: Optional[str] = None,
     pinned: bool = False,
     interpreter: Optional[str] = None,
+    run_lock: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1855,7 +1832,9 @@ def create_job(
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
-    (a venv can be rebuilt or moved after creation)."""
+    (a venv can be rebuilt or moved after creation). run_lock: optional consumer name for the
+    cross-producer run mutex (``cron/consumer_run_lock.py``); absent/blank means no lock at all and
+    identical current behaviour."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1943,6 +1922,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
+        ("run_lock", f["run_lock"]),
     ):
         if value is not None:
             job[key] = value

@@ -4,8 +4,8 @@ title: Consumer run lock — revised spec and plan
 
 # Consumer run lock
 
-Status: independent Hermes audit PASS for the B1 prerequisite, 9 October 2026. Codex orchestrates
-and reviews; Hermes implements. Supersedes B1 in the [blocked runtime proposal](./fundraising-runtime-extension-plan.md).
+Status: implemented and independently verified, 9 October 2026. Hermes implemented and
+audited; Codex corrected review defects and verified the final diff. Supersedes B1 in the [blocked runtime proposal](./fundraising-runtime-extension-plan.md).
 Source goal: serialize preflight → agent → saved report for scheduled/manual producers
 of one consumer without changing configured models, providers, fallbacks or tools.
 This is a runtime prerequisite only; fundraising token-bound consumer cutover, delivery
@@ -21,7 +21,8 @@ One non-reentrant, nonblocking mutex per canonical profile home and consumer nam
 process-local `threading.Lock` plus OS advisory lock. Hash the name with full SHA-256 for
 a private lock path under that profile's cron dir. Do not unlink lock files. Different
 profiles/consumers progress independently; threads and processes serving one consumer
-collide. Same-thread recursion raises a distinct error before any claim/ledger mutation: it must
+collide. Check recursion at the entry to `run_one_job`, before direct execution creation
+or worker launch, then acquire only after handoff. Same-thread recursion raises a distinct error before any claim/ledger mutation: it must
 never retire the outer owner as ordinary contention. Process death releases the OS lock, no TTL.
 
 Acquire within `run_one_job`, after external-worker handoff has resolved inside the worker,
@@ -39,7 +40,9 @@ Return through existing in-flight cleanup. Backend/I/O refusal is a precise reco
 computation failure, never silent contention or an unlocked run; perform the same unstarted
 claim cleanup without consuming a dispatch budget.
 
-POSIX reuses `_acquire_flock(fd, 0)` / `_release_flock` plus a nonblocking local guard.
+POSIX uses `fcntl.flock(LOCK_EX | LOCK_NB)` and reuses `_release_flock`, plus a
+nonblocking local guard. The existing `_acquire_flock` masks every OSError as contention;
+using it would hide EIO/ENOLCK/EBADF refusal. Only EAGAIN/EACCES mean contention.
 Windows's existing helper uses blocking `LK_LOCK`; do not call it for this feature.
 Until a native nonblocking Windows implementation is verified, opt-in jobs fail closed
 there. Unmodified jobs remain unchanged. Record this support boundary explicitly.
@@ -49,14 +52,21 @@ No new environment variable, token file, database column, ledger or publication 
 
 1. Add `cron/consumer_run_lock.py`: lock context yields false only for contention and
    raises a precise OSError for backend/I/O failure. Resolve profile home at call time;
-   use existing flock helpers on POSIX, never the blocking Windows helper. Protect the
+   use direct POSIX LOCK_NB with errno classification and the existing release helper;
+   never use the blocking Windows helper. Protect the
    keyed local guards with one mutex and do not remove a guard while another thread may
    hold a reference. Reuse the existing keyed-fence pattern. No generic lock framework.
 2. Extend `cron.jobs.create_job`'s optional keyword, existing create/update normalizers
    and persisted/readback representation. Add an owner-fenced
-   `release_unstarted_fire(job_id, expected_owner)` store helper using existing fire fence
+   `release_unstarted_fire(job_id, expected_owner, expected_manual_run_at=...,
+   expected_run_claim=...)` store helper in the lock sibling, re-exported by `cron.jobs`,
+   using the existing fire fence
    and jobs lock. Check the owner before atomically clearing its fire/manual/run claims;
-   preserve one-shot outage markers and all unrelated state. No cleanup of a newer owner.
+   preserve one-shot outage markers and all unrelated state. Match the snapshot manual
+   stamp/run claim separately, so a later trigger with the same fire owner survives.
+   No cleanup of a newer owner. Keep the existing optional-text normalizer semantics;
+   invalid non-text create/update values normalize to unset. Raw hand-edited jobs are
+   evaluated with those same name semantics.
 3. Wire a small sibling helper at the shared `run_one_job` seam, preserving facade size
    and complexity ratchets. Terminalize this execution and release owner-fenced claims
    on contention/backend error, always traversing existing in-flight finally. Do not move
@@ -93,3 +103,24 @@ Audit pins: SHA-256 is explicit (do not inherit the fire fence UUID5 path); opti
 normalizer maps None/blank to None; load/get round-trip the stored field. The heartbeat
 wrapper calls its body inline, joining only its refresh thread in finally. Tests must
 prove these facts and recursive refusal without retiring the outer owner.
+
+
+## Verification receipt — 9 October 2026
+
+Hermes's final offline implementation review: PASS for the supplied B1 packet; external
+tools disabled, existing configured model retained. Codex independently verified the store,
+ledger and scheduler callers omitted from that review. The ledger helper already handles
+expected SQLite/OSError failures; no duplicate blanket catch was added.
+
+Canonical runner: 161 cron/immediate-run files, 1,547 passing tests, 12 native-platform skips;
+26 new lock tests passed. `scripts/check --staged --base a39cc18a7e68`: all 11 checks pass,
+zero health findings. Seven regressions first failed against the draft implementation:
+OS backend error classification (three errno cases), local-guard exclusion, private file
+mode, direct recursion before receipt creation, and preserving a later manual trigger.
+A real fake preflight subprocess observes the held lock. No live adapter/model/state writes.
+
+Verification used a temporary clone outside the live Hermes home, Python 3.14 and already
+installed production/test packages, including the cached async test plugin. Earlier Python
+3.11/import/plugin failures were resolved in that disposable test environment; no dependency
+was added to the repository or installed. Native Windows/Linux paths remain untested here.
+B1 is a prerequisite; fundraising B2/C/D and live job activation remain incomplete.

@@ -375,7 +375,8 @@ def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> No
 def recover_interrupted_executions() -> int:
     """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
     dead, plus rows whose live owner holds a claim older than the derived stale bound (the
-    process is not killed)."""
+    process is not killed). Positively dead owners also release never-claimed artifact
+    receipts, including orphan anchors on already terminal execution rows."""
     now = _hermes_now().isoformat()
     changed = 0
     recovered: list[dict[str, Any]] = []
@@ -383,6 +384,14 @@ def recover_interrupted_executions() -> int:
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
     stale_after: Optional[float] = None
     stale_after_resolved = False
+    with _transaction(immediate=True) as conn:
+        for receipt_row in conn.execute(
+            "SELECT * FROM executions WHERE delivery_receipt IS NOT NULL"
+        ).fetchall():
+            if _retire_dead_unsent_receipt(conn, receipt_row):
+                recovered.append(_fetch(conn, receipt_row["id"]))
+    # Keep run-owner reconciliation separate: adoption can change a claim while
+    # liveness is checked, and its existing owner CAS protects that race.
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
@@ -439,6 +448,9 @@ def recover_interrupted_executions() -> int:
                     recovered.append(record)
         if changed:
             _prune_unlocked(conn)
+        # Emit the final row once when receipt retirement and run terminalization coincide.
+        recovered = [_fetch(conn, execution_id) for execution_id in
+                     dict.fromkeys(record["id"] for record in recovered)]
     for record in recovered:
         _emit_execution_state(record)
     return changed
@@ -464,13 +476,15 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
     worker that is still running must never be terminalized out from under itself.
     """
     now = _hermes_now().isoformat()
-    with _transaction() as conn:
+    with _transaction(immediate=True) as conn:
         row = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at
-               FROM executions WHERE id=?""",
+            """SELECT * FROM executions WHERE id=?""",
             (execution_id,),
         ).fetchone()
+        if row is not None:
+            _retire_dead_unsent_receipt(conn, row)
+    with _transaction() as conn:
+        row = conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
         if row is None or row["status"] not in ("claimed", "running"):
             return False
         if row["process_id"] == _PROCESS_ID:
@@ -650,6 +664,35 @@ def _delivery_owner_is_dead(row) -> bool:
         return False
 
 
+def _retire_dead_unsent_receipt(conn, row) -> bool:
+    """Retire only a positively dead owner's never-claimed anchor, under the caller's lock.
+
+    Queue claims take the same immediate execution transaction: either the sender wins
+    and this leaves its attempt fenced, or retirement wins and the old anchor cannot send.
+    Terminal execution rows are eligible because a previous reaper may have closed the run.
+    """
+    if not row['delivery_receipt']:
+        return False
+    if (row['handoff_pending'] and row['handoff_started_at'] is not None
+            and time.time() - float(row['handoff_started_at']) < HANDOFF_ADOPTION_GRACE_SECONDS):
+        return False
+    try:
+        receipt = _decode_receipt(row)
+    except (ValueError, TypeError, KeyError):
+        logger.warning('Corrupt artifact anchor; keeping dead-owner delivery fence')
+        return False
+    if (receipt['state'] != 'unsent' or receipt.get('attempt_nonce') is not None
+            or receipt.get('evidence') is not None or not _delivery_owner_is_dead(row)):
+        return False
+    receipt.update(state='failed_certain', reason='owner exited before dispatch',
+                   settled_at=_hermes_now().isoformat())
+    return conn.execute(
+        'UPDATE executions SET delivery_receipt=?, delivery_outcome=? '
+        'WHERE id=? AND delivery_receipt=? AND process_id=? AND pid=? AND process_started_at IS ?',
+        (json.dumps(receipt), 'failed', row['id'], row['delivery_receipt'], row['process_id'],
+         row['pid'], row['process_started_at'])).rowcount == 1
+
+
 def prepare_delivery_request(execution_id: str, job_id: str, request: dict) -> dict:
     """Bind an owned execution to immutable ID/hash metadata before any dispatch."""
     key, digest = _delivery_identity(request)
@@ -663,12 +706,8 @@ def prepare_delivery_request(execution_id: str, job_id: str, request: dict) -> d
             receipt = _decode_receipt(row)
             if receipt['request_sha256'] != digest:
                 raise ValueError('artifact request identity conflict')
-            if (receipt['state'] == 'unsent' and not receipt.get('attempt_nonce')
-                    and not receipt.get('evidence')
-                    and _delivery_owner_is_dead(row)):
-                receipt.update(state='failed_certain', reason='owner exited before dispatch')
-                conn.execute('UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
-                             (json.dumps(receipt), row['id'], row['delivery_receipt']))
+            if _retire_dead_unsent_receipt(conn, row):
+                continue
             elif receipt['state'] != 'failed_certain':
                 if active is not None:
                     raise ValueError('duplicate active artifact request')

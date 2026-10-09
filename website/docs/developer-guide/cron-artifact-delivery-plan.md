@@ -258,6 +258,17 @@ Reconciliation must not strand its `unsent` request forever: in BEGIN IMMEDIATE,
 prove the owning execution PID/start-time is dead using the existing fail-safe
 owner check, confirm state unsent with no attempt nonce or any chunk/file receipt,
 then CAS unsent -> failed_certain with reason “owner exited before dispatch.”
+The shared execution helper `_retire_dead_unsent_receipt(conn, row)` performs
+this CAS in request preparation, startup/periodic `recover_interrupted_executions`,
+and explicit `terminalize_dead_owner`. The sweep inspects receipt-bearing terminal
+rows as well as active runs, so an earlier run timeout or pre-fix recovery cannot
+leave an orphan `unsent` anchor. It records `delivery_outcome=failed` while leaving
+terminal run status/error untouched; newly abandoned active runs remain `unknown`.
+Handoff adoption grace, live/wedged/unverifiable owners, any nonce/evidence, and
+all non-unsent receipt states retain their fences. Readers remain read-only.
+Recovery and queue claims use the same immediate execution transaction, so a
+pending queue row loses permission to send if recovery wins; a claim that wins
+first leaves `sending` fenced. No consumer recovery or additional job is needed.
 Preserve that old receipt row. The partial unique index now permits a new exact-
 identity claim on the next execution. Any live/unknown owner or sending/unknown
 attempt stays fenced. An old pending queue row may not dispatch after this CAS;

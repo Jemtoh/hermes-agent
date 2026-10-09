@@ -13,6 +13,8 @@ is deliberately fail-closed here and lands in a separate task.
 from __future__ import annotations
 
 import hashlib
+import json
+from contextvars import copy_context
 import logging
 import os
 import threading
@@ -23,7 +25,7 @@ logger = logging.getLogger("cron.scheduler")
 # One bounded wait for the whole dispatch. A send that outlasts it is LEFT RUNNING; the
 # late callback owns the outcome from then on.
 _DISPATCH_TIMEOUT_SECS = 60.0
-_LATE_CALLBACKS: set = set()
+_LATE_CALLBACKS: dict = {}
 _LATE_CALLBACKS_LOCK = threading.Lock()
 
 
@@ -32,33 +34,31 @@ def _sha256(data: bytes) -> str:
 
 
 def _expected_target(chat_id, thread_id) -> dict:
-    """Must match ``plugins/platforms/telegram/adapter._delivery_target_proof`` exactly."""
+    """Must match ``plugins/platforms/telegram/adapter_delivery.delivery_target`` exactly."""
     return {"platform": "telegram", "chat_id": str(chat_id),
             "thread_id": str(thread_id) if thread_id is not None else None}
 
 
-def build_request_identity(envelope: dict, target: dict) -> dict:
+def build_request_identity(envelope: dict, target: dict, snapshots=None) -> dict:
     """Canonical immutable request identity: token/purpose/target/digests/artifact metadata.
 
     No message text, no local path, no document bytes — the receipt is durable identity,
-    not evidence. Sizes come from the real file so a policy refusal surfaces here, before
-    the request is ever claimed.
+    not evidence. Sizes come from retained byte snapshots, before any dispatch claim.
     """
-    from cron.artifact_delivery import _hex
-    from gateway.platforms.base import validate_media_delivery_path
+    from cron.artifact_delivery import validate_envelope
 
-    _hex(envelope["token"], 32)
-    _hex(envelope["message_sha256"], 64)
-    artifacts = []
-    for artifact in envelope["artifacts"]:
-        _hex(artifact["sha256"], 64)
-        resolved = validate_media_delivery_path(artifact["path"])
-        if resolved is None:
-            raise ValueError("artifact path refused by media policy")
-        artifacts.append({
-            "kind": artifact["kind"], "sha256": artifact["sha256"],
-            "transport": artifact["transport"], "size": os.path.getsize(resolved),
-        })
+    envelope = validate_envelope(json.loads(json.dumps(envelope)), verify_files=False)
+    snapshots = snapshot_request(envelope) if snapshots is None else snapshots
+    if len(snapshots) != len(envelope["artifacts"]):
+        raise ValueError("artifact snapshot inventory mismatch")
+    for item, expected in zip(snapshots, envelope["artifacts"]):
+        if (any(item[field] != expected[field] for field in ("kind", "transport", "sha256"))
+                or not isinstance(item["bytes"], bytes) or _sha256(item["bytes"]) != expected["sha256"]):
+            raise ValueError("artifact snapshot identity mismatch")
+    artifacts = [{"kind": item["kind"], "sha256": item["sha256"],
+                  "transport": item["transport"], "size": len(item["bytes"])}
+                 for item in snapshots]
+
     return {
         "token": envelope["token"], "purpose": envelope["purpose"],
         "target": _expected_target(target["chat_id"], target.get("thread_id")),
@@ -84,6 +84,8 @@ def snapshot_request(envelope: dict) -> list:
             data = handle.read()
         if _sha256(data) != artifact["sha256"]:
             raise ValueError("artifact digest changed before dispatch")
+        if artifact["transport"] == "text" and data != envelope["message"].encode("utf-8"):
+            raise ValueError("text artifact must match exact notification")
         snapshots.append({
             "kind": artifact["kind"], "transport": artifact["transport"],
             "sha256": artifact["sha256"], "bytes": data,
@@ -104,45 +106,43 @@ def _receipt_from(result) -> dict:
 
 def _notification_problem(result, text: str, target: dict) -> str:
     """Structural completeness of a notification receipt. A single first ID proves nothing."""
-    proof = _receipt_from(result)
-    if not proof:
-        return "no notification receipt"
-    if proof.get("complete") is not True or proof.get("role") != "notification":
-        return "notification receipt is incomplete"
-    if proof.get("incoming_sha256") != _sha256(text.encode("utf-8")):
-        return "notification digest mismatch"
-    if proof.get("target") != target:
-        return "notification target mismatch"
-    chunks = proof.get("chunks")
-    if not isinstance(chunks, list) or not chunks or proof.get("count") != len(chunks):
-        return "notification chunk count mismatch"
-    seen = set()
-    for index, entry in enumerate(chunks):
-        if not isinstance(entry, dict) or entry.get("index") != index:
-            return "notification chunk index gap"
-        message_id = entry.get("message_id")
-        if not isinstance(message_id, str) or not message_id or message_id in seen:
-            return "notification chunk message id is missing or duplicated"
-        seen.add(message_id)
-        if not isinstance(entry.get("sha256"), str):
-            return "notification chunk hash is missing"
+    from cron.artifact_proof import notification
+
+    if not _succeeded(result):
+        return "notification send was not successful"
+    try:
+        proof = _receipt_from(result)
+        notification(proof, _sha256(text.encode("utf-8")), target)
+        if proof["incoming_size"] != len(text.encode("utf-8")):
+            return "notification size mismatch"
+        if _result_id(result) != proof["chunks"][0]["message_id"]:
+            return "notification provider result id mismatch"
+    except (ValueError, TypeError, KeyError) as exc:
+        return str(exc)
     return ""
 
 
+def _result_id(result):
+    return result.get("message_id") if isinstance(result, dict) else getattr(result, "message_id", None)
+
+
+def _succeeded(result):
+    return (result.get("success") if isinstance(result, dict)
+            else getattr(result, "success", None)) is True
+
+
 def _document_problem(result, snapshot: dict, target: dict) -> str:
-    """A fallback link/text, a missing ID or a changed file can never grant verified."""
-    proof = _receipt_from(result)
-    if not proof:
-        return "no native document receipt"
-    if proof.get("role") != "document" or proof.get("method") != "send_document":
-        return "document was not sent natively"
-    if proof.get("sha256") != snapshot["sha256"]:
-        return "document digest mismatch"
-    message_id = proof.get("message_id")
-    if not isinstance(message_id, str) or not message_id:
-        return "document message id is missing"
-    if proof.get("target") != target:
-        return "document target mismatch"
+    from cron.artifact_proof import document
+
+    if not _succeeded(result):
+        return "document send was not successful"
+    try:
+        document(_receipt_from(result), {"sha256": snapshot["sha256"],
+                                       "size": len(snapshot["bytes"])}, target)
+        if _result_id(result) != _receipt_from(result)["message_id"]:
+            return "document provider result id mismatch"
+    except (ValueError, TypeError, KeyError) as exc:
+        return str(exc)
     return ""
 
 
@@ -157,24 +157,31 @@ def _evidence(execution_id, request_sha256, attempt_nonce, target, notification,
     }
 
 
-def _collect(message, target, notification_result, artifact_results) -> tuple:
+def _collect(message, target, notification_result, artifact_results, *, expected_artifacts) -> tuple:
     """``(ok, evidence, reason)`` — complete provider proof for every required artifact."""
+    actual = [{"kind": snapshot["kind"], "transport": snapshot["transport"],
+               "sha256": snapshot["sha256"], "size": len(snapshot["bytes"])}
+              for snapshot, _ in artifact_results]
+    if actual != expected_artifacts:
+        return False, None, "artifact receipt inventory mismatch"
     notification_problem = _notification_problem(notification_result, message, target)
     if notification_problem:
         return False, None, notification_problem
     artifacts = []
-    for snapshot, result in artifact_results:
-        problem = _document_problem(result, snapshot, target)
-        if problem:
-            return False, None, problem
-        proof = _receipt_from(result)
-        artifacts.append({"kind": snapshot["kind"], "sha256": snapshot["sha256"],
-                          "message_id": proof["message_id"], "method": proof["method"],
-                          "size": len(snapshot["bytes"])})
     proof = _receipt_from(notification_result)
-    notification = {"sha256": proof["incoming_sha256"], "count": proof["count"],
-                    "chunks": [dict(entry) for entry in proof["chunks"]]}
-    return True, {"notification": notification, "artifacts": artifacts}, ""
+    for snapshot, result in artifact_results:
+        if snapshot["transport"] == "text":
+            if snapshot["sha256"] != _sha256(message.encode("utf-8")) or snapshot["bytes"] != message.encode("utf-8"):
+                return False, None, "text artifact differs from notification"
+            artifact_proof = proof
+        else:
+            problem = _document_problem(result, snapshot, target)
+            if problem:
+                return False, None, problem
+            artifact_proof = _receipt_from(result)
+        artifacts.append({"kind": snapshot["kind"], "transport": snapshot["transport"],
+                          "proof": artifact_proof})
+    return True, {"notification": proof, "artifacts": artifacts}, ""
 
 
 async def _dispatch(transport, config, chat_id, thread_id, message, snapshots, metadata):
@@ -198,7 +205,12 @@ async def _dispatch(transport, config, chat_id, thread_id, message, snapshots, m
         logger.warning("Artifact notification send failed (%s)", type(exc).__name__, exc_info=True)
 
     artifact_results = []
+    if isinstance(notification_result, dict) and notification_result.get("delivered") is False:
+        return notification_result, artifact_results
     for snapshot in snapshots:
+        if snapshot["transport"] == "text":
+            artifact_results.append((snapshot, notification_result))
+            continue
         try:
             result = await transport.adapter.send_document(
                 chat_id=str(chat_id), file_path=snapshot["path"], file_name=snapshot["name"],
@@ -214,17 +226,33 @@ async def _dispatch(transport, config, chat_id, thread_id, message, snapshots, m
 def _settle(execution_id, request_sha256, attempt_nonce, profile_sha256, message, target,
             notification_result, artifact_results) -> tuple:
     """Settle the exact attempt once: verified only on complete evidence, else unknown."""
-    from cron.executions import settle_delivery_request
+    from cron.executions import reconcile_delivery_request, settle_delivery_request
+    from cron.artifact_proof import evidence as validate_evidence
 
-    ok, evidence, reason = _collect(message, target, notification_result, artifact_results)
+    suppressed = (isinstance(notification_result, dict)
+                  and notification_result.get("delivered") is False
+                  and notification_result.get("filtered") == "silence_narration")
+    anchor = reconcile_delivery_request(execution_id, request_sha256, attempt_nonce=attempt_nonce)
+    if anchor is None:
+        return False, "artifact request anchor missing; evidence not applied"
+    ok, evidence, reason = _collect(message, target, notification_result, artifact_results,
+                                    expected_artifacts=anchor["request"]["artifacts"])
+    if suppressed:
+        ok, evidence, reason = False, None, "delivery suppressed; no provider send"
     if ok:
         evidence = _evidence(execution_id, request_sha256, attempt_nonce, target,
                              evidence["notification"], evidence["artifacts"])
+    if ok:
+        try:
+            validate_evidence(evidence, anchor)
+        except (ValueError, TypeError, KeyError) as exc:
+            ok, evidence, reason = False, None, str(exc)
     receipt = settle_delivery_request(
         execution_id, request_sha256, attempt_nonce=attempt_nonce,
-        state="verified" if ok else "unknown", evidence=evidence, reason=None if ok else reason,
+        state="suppressed" if suppressed else "verified" if ok else "unknown", evidence=evidence, reason=None if ok else reason,
         profile_sha256=profile_sha256)
     if receipt is None:
+        ok, reason = False, "attempt already settled; evidence not applied"
         logger.warning("Artifact attempt %s was already settled; late evidence not applied",
                        attempt_nonce)
     return ok, reason
@@ -237,23 +265,36 @@ def _install_late_callback(future, *, execution_id, request_sha256, attempt_nonc
     The receipt settle is itself a CAS on the captured attempt nonce, so a duplicate callback
     could not double-record; the guard here keeps the callback list from growing per retry.
     """
-    key = (execution_id, attempt_nonce)
+    key = (profile_sha256, execution_id, attempt_nonce)
     with _LATE_CALLBACKS_LOCK:
         if key in _LATE_CALLBACKS:
             return False
-        _LATE_CALLBACKS.add(key)
+        _LATE_CALLBACKS[key] = future
 
-    def _late(done):
+    context = copy_context()
+
+    def _late_in_scope(done):
         try:
             notification_result, artifact_results = done.result()
             _settle(execution_id, request_sha256, attempt_nonce, profile_sha256, message,
                     target, notification_result, artifact_results)
         except Exception as exc:
+            from cron.executions import settle_delivery_request
+
+            settle_delivery_request(execution_id, request_sha256, attempt_nonce=attempt_nonce,
+                                    state="unknown", reason="late provider completion failed",
+                                    profile_sha256=profile_sha256)
             logger.warning("Artifact late completion could not be recorded (%s)",
                            type(exc).__name__, exc_info=True)
         finally:
             with _LATE_CALLBACKS_LOCK:
-                _LATE_CALLBACKS.discard(key)
+                _LATE_CALLBACKS.pop(key, None)
+
+    def _late(done):
+        try:
+            context.run(_late_in_scope, done)
+        except Exception:
+            logger.warning("Artifact late settlement failed; outcome remains unknown", exc_info=True)
 
     future.add_done_callback(_late)
     return True
@@ -265,7 +306,7 @@ def deliver_artifact(job: dict, *, adapters=None, loop=None):
     Returns ``None`` on success, else an explicit error string (never a silent success).
     """
     if not job.get("_artifact_delivery"):
-        return None
+        return "artifact delivery envelope missing; not sent"
     try:
         return _deliver(job, job["_artifact_delivery"], adapters=adapters, loop=loop)
     except Exception as exc:
@@ -276,12 +317,11 @@ def deliver_artifact(job: dict, *, adapters=None, loop=None):
 
 def _deliver(job: dict, envelope: dict, *, adapters, loop) -> Optional[str]:
     from cron.executions import (
-        claim_delivery_request, prepare_delivery_request, settle_delivery_request,
+        claim_delivery_request, settle_delivery_request,
     )
     from gateway.config import Platform
     from gateway.delivery import resolve_delivery_transport
 
-    job_id = str(job.get("id") or "")
     execution_id = str(job.get("execution_id") or "")
     if not execution_id:
         return "artifact delivery requires an owned execution attempt; not sent"
@@ -302,10 +342,15 @@ def _deliver(job: dict, envelope: dict, *, adapters, loop) -> Optional[str]:
         return ("artifact delivery requires a live native Telegram transport "
                 "(relay cannot carry a byte snapshot); not sent")
 
-    snapshots = snapshot_request(envelope)
-    identity = build_request_identity(envelope, target)
-    expected_target = identity["target"]
-    receipt = prepare_delivery_request(execution_id, job_id, identity)
+    from cron.scheduler_provider import _profile_cron_scope
+    from hermes_constants import get_hermes_home
+
+    owning_home = get_hermes_home()
+    envelope, target, snapshots, receipt = prepare_artifact_request(job)
+    expected_target = receipt["request"]["target"]
+    if receipt["execution_id"] != execution_id:
+        return ("artifact request already claimed or settled; not resent "
+                f"(state={receipt['state']}, execution={receipt['execution_id']})")
     claimed = claim_delivery_request(execution_id, receipt["request_sha256"])
     if claimed is None:
         return ("artifact request already claimed or settled; not resent "
@@ -328,15 +373,45 @@ def _deliver(job: dict, envelope: dict, *, adapters, loop) -> Optional[str]:
         notification_result, artifact_results = future.result(timeout=_DISPATCH_TIMEOUT_SECS)
     except TimeoutError:
         # Keep the future ALIVE: the send may still land. The callback records the outcome.
-        _install_late_callback(
-            future, execution_id=execution_id, request_sha256=receipt["request_sha256"],
+        with _profile_cron_scope(owning_home):
+            _install_late_callback(
+                future, execution_id=execution_id, request_sha256=receipt["request_sha256"],
             attempt_nonce=attempt_nonce, profile_sha256=profile_sha256,
             message=envelope["message"], target=expected_target)
         return ("artifact delivery to telegram is unverified (timed out in flight); "
                 "completion recorded when it lands; do not resend")
+    except Exception:
+        logger.warning("Artifact dispatch failed in flight; no resend", exc_info=True)
+        settle_delivery_request(execution_id, receipt["request_sha256"], attempt_nonce=attempt_nonce,
+                                state="unknown", reason="provider dispatch failed in flight",
+                                profile_sha256=profile_sha256)
+        return "artifact delivery unverified: provider dispatch failed; do not resend"
     ok, reason = _settle(execution_id, receipt["request_sha256"], attempt_nonce, profile_sha256,
                          envelope["message"], expected_target, notification_result, artifact_results)
+    if reason == "delivery suppressed; no provider send":
+        return "artifact delivery suppressed; not sent"
     return None if ok else f"artifact delivery unverified: {reason}"
+
+
+def prepare_artifact_request(job: dict) -> tuple:
+    """Prepare under the active execution owner; return ephemeral sender inputs and anchor.
+
+    Returns ``(envelope, target, snapshots, receipt)``. Only the receipt's identity is
+    JSON-safe queue metadata: never serialize snapshots. A prior execution anchor is a
+    refusal to enqueue/send, including when its state is already verified.
+    """
+    from cron.artifact_delivery import validate_envelope
+    from cron.executions import prepare_delivery_request
+
+    targets = _targets(job)
+    if len(targets) != 1 or str(targets[0].get("platform", "")).lower() != "telegram":
+        raise ValueError("artifact delivery requires exactly one authorized Telegram target")
+    envelope = validate_envelope(json.loads(json.dumps(job["_artifact_delivery"])), verify_files=False)
+    snapshots = snapshot_request(envelope)
+    target = targets[0]
+    identity = build_request_identity(envelope, target, snapshots)
+    receipt = prepare_delivery_request(str(job["execution_id"]), str(job["id"]), identity)
+    return envelope, target, snapshots, receipt
 
 
 def _targets(job: dict) -> list:

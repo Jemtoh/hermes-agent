@@ -3364,23 +3364,30 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             _TimedOut = None  # type: ignore[assignment,misc]
         return _NetErr, _BadReq, _TimedOut
 
-    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any]):
+    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any], submitted=None):
         """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
+        text = chunk
         try:
-            return await _await_with_thread_deadline(
-                self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
+            msg = await _await_with_thread_deadline(
+                self._bot.send_message(text=text, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         except Exception as md_error:
-            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                return await _await_with_thread_deadline(
-                    self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
-                    timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
-            raise
+            if "parse" not in str(md_error).lower() and "markdown" not in str(md_error).lower():
+                raise
+            logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+            text = _strip_mdv2(chunk)
+            msg = await _await_with_thread_deadline(
+                self._bot.send_message(text=text, parse_mode=None, **send_kwargs),
+                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+        if submitted is not None:
+            submitted.append({"sha256": _delivery.sha256_hex(text.encode("utf-8")),
+                              "thread_id": send_kwargs.get("message_thread_id")
+                              or send_kwargs.get("direct_messages_topic_id")})
+        return msg
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
-        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple):
+        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple, submitted=None):
         """Deliver one chunk: routing, up to 3 attempts, thread-not-found / deleted-anchor / flood handling.
 
         Returns ``(msg, used_thread_fallback)`` on success or a ``SendResult`` to return verbatim (fail-loud DM-topic
@@ -3401,7 +3408,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs, submitted), used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
@@ -3626,23 +3633,32 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
         used_thread_fallback = False
         prior = len(delivered)
         chunk_proof: list[dict[str, Any]] = []
+        submitted = [] if incoming is not None else None
         for chunk in chunks:
             index = len(delivered)
             outcome = await self._send_chunk_with_retries(
-                chat_id, chunk, index, reply_to, metadata, thread_id, used_thread_fallback, error_types)
+                chat_id, chunk, index, reply_to, metadata, thread_id, used_thread_fallback, error_types,
+                submitted=submitted)
             if isinstance(outcome, SendResult):
                 # Every SendResult returned here is a DEFINITE non-delivery (flood cap, DM-topic refusal);
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
                 return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
             msg, used_thread_fallback = outcome
+            if not _delivery.valid_message_id(msg.message_id):
+                return self._with_partial_send(
+                    SendResult(success=False, error="Provider acceptance missing message id", retryable=False),
+                    chunks[len(delivered) - prior:], delivered, tail_certain=False)
             delivered.append(str(msg.message_id))
-            chunk_proof.append({"index": index, "sha256": _delivery.sha256_hex(chunk.encode("utf-8")),
+            chunk_proof.append({"index": index, "sha256": submitted[-1]["sha256"] if submitted else "",
                                 "message_id": str(msg.message_id)})
         await self._retrigger_typing(chat_id, metadata)
         raw_response: dict[str, Any] = {
             "message_ids": list(delivered), "requested_thread_id": requested_thread_id,
             "thread_fallback": used_thread_fallback}
-        if incoming is not None and len(chunk_proof) == len(chunks):
+        if (incoming is not None and len(chunk_proof) == len(chunks) and not used_thread_fallback
+                and len(submitted) == len(chunks) and all(
+                    (str(item["thread_id"]) if item["thread_id"] is not None else None)
+                    == (str(thread_id) if thread_id is not None else None) for item in submitted)):
             raw_response["delivery_receipt"] = _delivery.chunked_notification_proof(
                 incoming, chunk_proof, chat_id, thread_id)
         return SendResult(
@@ -5278,8 +5294,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             raw_response = None
             if snapshot is not None:
                 raw_response = {"delivery_receipt": _delivery.document_proof(
-                    snapshot, chat_id, self._metadata_thread_id(metadata), msg.message_id,
+                    snapshot, chat_id, getattr(msg, "message_thread_id", None), msg.message_id,
                     media_key)}
+                if raw_response["delivery_receipt"] is None:
+                    return SendResult(success=False, error="Provider acceptance missing message id", retryable=False)
             return SendResult(success=True, message_id=str(msg.message_id), raw_response=raw_response)
         except Exception as e:
             return await on_error(e)

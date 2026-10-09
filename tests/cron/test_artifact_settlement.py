@@ -35,12 +35,16 @@ def _claimed(ledger, identity):
     return execution, claimed
 
 
-def _evidence():
-    return {'target': {'platform': 'telegram', 'chat_id': '123', 'thread_id': None},
-            'notification': {'sha256': 'd' * 64, 'count': 1,
+def _evidence(claimed):
+    target = claimed['request']['target']
+    return {'execution_id': claimed['execution_id'], 'request_sha256': claimed['request_sha256'],
+            'attempt_nonce': claimed['attempt_nonce'], 'target': target,
+            'notification': {'role': 'notification', 'provider': 'telegram', 'method': 'send_message',
+                             'complete': True, 'incoming_size': 10, 'incoming_sha256': 'b' * 64, 'count': 1, 'target': target,
                              'chunks': [{'index': 0, 'message_id': '7', 'sha256': 'e' * 64}]},
-            'artifacts': [{'kind': 'report', 'sha256': 'c' * 64, 'message_id': '8',
-                           'method': 'send_document', 'size': 20}]}
+            'artifacts': [{'kind': 'report', 'transport': 'document', 'proof': {
+                'role': 'document', 'provider': 'telegram', 'target': target,
+                'sha256': 'c' * 64, 'message_id': '8', 'method': 'send_document', 'size': 20}}]}
 
 
 def test_settle_is_once_only_and_bound_to_digest_and_attempt_nonce(ledger, identity):
@@ -54,7 +58,7 @@ def test_settle_is_once_only_and_bound_to_digest_and_attempt_nonce(ledger, ident
 
     settled = ledger.settle_delivery_request(
         execution['id'], claimed['request_sha256'], attempt_nonce=claimed['attempt_nonce'],
-        state='verified', evidence=_evidence())
+        state='verified', evidence=_evidence(claimed))
     assert settled['state'] == 'verified'
     assert settled['evidence']['notification']['chunks'][0]['message_id'] == '7'
 
@@ -94,7 +98,7 @@ def test_settle_is_fenced_to_the_owning_profile(ledger, identity):
     assert ledger.get_artifact_delivery_receipt(identity['token'], 'report')['state'] == 'sending'
     assert ledger.settle_delivery_request(
         execution['id'], claimed['request_sha256'], attempt_nonce=claimed['attempt_nonce'],
-        state='verified', profile_sha256=claimed['sender_profile_sha256'])['state'] == 'verified'
+        state='verified', profile_sha256=claimed['sender_profile_sha256'], evidence=_evidence(claimed))['state'] == 'verified'
 
 
 def test_reconcile_reads_the_exact_anchor_without_mutating(ledger, identity):
@@ -114,7 +118,7 @@ def test_stale_timeout_outcome_cannot_clobber_a_late_verified_receipt(ledger, id
     execution, claimed = _claimed(ledger, identity)
     ledger.settle_delivery_request(
         execution['id'], claimed['request_sha256'], attempt_nonce=claimed['attempt_nonce'],
-        state='verified')
+        state='verified', evidence=_evidence(claimed))
     record = ledger.finish_execution(execution['id'], success=True, delivery_outcome='unknown')
     assert record['delivery_outcome'] == 'delivered'
 
@@ -135,3 +139,62 @@ def test_settled_unknown_never_permits_a_resend(ledger, identity):
     receipt = ledger.get_artifact_delivery_receipt(identity['token'], 'report')
     assert receipt['state'] == 'unknown'
     assert json.loads(ledger.get_execution(execution['id'])['delivery_receipt'])['state'] == 'unknown'
+
+
+@pytest.mark.parametrize('mutation', ['none', 'missing', 'extra', 'duplicate', 'digest', 'size',
+                                     'attempt', 'target', 'hidden', 'bool_count', 'bool_index'])
+def test_verified_requires_full_matching_evidence(ledger, identity, mutation):
+    execution, claimed = _claimed(ledger, identity)
+    proof = _evidence(claimed)
+    mutations = {
+        'missing': lambda: proof.update(artifacts=[]),
+        'extra': lambda: proof['artifacts'].append(proof['artifacts'][0]),
+        'duplicate': lambda: proof['artifacts'].append(proof['artifacts'][0]),
+        'digest': lambda: proof['notification'].update(incoming_sha256='f' * 64),
+        'size': lambda: proof['artifacts'][0]['proof'].update(size=999),
+        'attempt': lambda: proof.update(execution_id='another-execution'),
+        'target': lambda: proof.update(target={'platform': 'telegram', 'chat_id': '999', 'thread_id': None}),
+        'hidden': lambda: proof['notification'].update(disguised_evidence='full secret report body'),
+        'bool_count': lambda: proof['notification'].update(count=True),
+        'bool_index': lambda: proof['notification']['chunks'][0].update(index=False),
+    }
+    if mutation == 'none':
+        proof = None
+    else:
+        mutations[mutation]()
+    with pytest.raises(ValueError):
+        ledger.settle_delivery_request(execution['id'], claimed['request_sha256'],
+                                      attempt_nonce=claimed['attempt_nonce'], state='verified', evidence=proof)
+    assert ledger.get_artifact_delivery_receipt(identity['token'], 'report')['state'] == 'sending'
+
+
+def test_late_verified_reconciles_terminal_row_without_changing_run_success(ledger, identity):
+    execution, claimed = _claimed(ledger, identity)
+    before = ledger.finish_execution(execution['id'], success=False, error='timed out',
+                                     delivery_outcome='unknown')
+    ledger.settle_delivery_request(execution['id'], claimed['request_sha256'],
+                                  attempt_nonce=claimed['attempt_nonce'], state='verified',
+                                  evidence=_evidence(claimed))
+    after = ledger.get_execution(execution['id'])
+    assert after['delivery_outcome'] == 'delivered'
+    assert after['status'] == before['status'] and after['error'] == before['error']
+
+
+def test_corrupt_receipt_closes_positive_finish(ledger, identity):
+    execution, _ = _claimed(ledger, identity)
+    with ledger._transaction() as conn:
+        conn.execute('UPDATE executions SET delivery_receipt=? WHERE id=?',
+                     ('{"version":1,"state":"verified"}', execution['id']))
+    assert ledger.finish_execution(execution['id'], success=True,
+                                   delivery_outcome='delivered')['delivery_outcome'] == 'unknown'
+
+
+def test_failed_certain_cannot_disguise_acceptance_or_ambiguous_failure(ledger, identity):
+    execution, claimed = _claimed(ledger, identity)
+    for evidence, reason in ((_evidence(claimed), 'gateway loop unavailable before dispatch'),
+                             (None, 'provider timed out after dispatch')):
+        with pytest.raises(ValueError):
+            ledger.settle_delivery_request(execution['id'], claimed['request_sha256'],
+                                          attempt_nonce=claimed['attempt_nonce'], state='failed_certain',
+                                          evidence=evidence, reason=reason)
+    assert ledger.get_artifact_delivery_receipt(identity['token'], 'report')['state'] == 'sending'

@@ -42,8 +42,9 @@ def delivery_target(chat_id: Any, thread_id: Any) -> dict:
 def chunked_notification_proof(incoming: str, chunks: list, chat_id: Any, thread_id: Any) -> dict:
     """One entry per submitted MarkdownV2 chunk, in order, with each landed message ID."""
     return {
-        "role": "notification", "provider": "telegram", "complete": True,
+        "role": "notification", "provider": "telegram", "method": "send_message", "complete": True,
         "count": len(chunks), "incoming_sha256": sha256_hex(incoming.encode("utf-8")),
+        "incoming_size": len(incoming.encode("utf-8")),
         "target": delivery_target(chat_id, thread_id), "chunks": chunks,
     }
 
@@ -55,23 +56,30 @@ def rich_notification_proof(incoming: str, payload: dict, chat_id: Any, thread_i
     ``None`` when Telegram returned no message ID, so a caller never has to assume the
     legacy MarkdownV2 chunk path ran.
     """
-    if message_id is None:
+    if not valid_message_id(message_id):
         return None
     payload_digest = sha256_hex(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8"))
     return {
-        "role": "notification", "provider": "telegram", "complete": True, "count": 1,
+        "role": "notification", "provider": "telegram", "method": "sendRichMessage", "complete": True, "count": 1,
         "incoming_sha256": sha256_hex(incoming.encode("utf-8")),
+        "incoming_size": len(incoming.encode("utf-8")),
         "payload_sha256": payload_digest, "target": delivery_target(chat_id, thread_id),
         "chunks": [{"index": 0, "sha256": payload_digest, "message_id": str(message_id)}],
     }
 
 
 def document_proof(snapshot: bytes, chat_id: Any, thread_id: Any, message_id: Any,
-                   media_key: str = "document") -> dict:
+                   media_key: str = "document") -> Optional[dict]:
     """Proof that THESE bytes were uploaded natively and Telegram returned this message ID."""
+    if not valid_message_id(message_id):
+        return None
     return {
         "role": "document", "provider": "telegram", "method": f"send_{media_key}",
         "sha256": sha256_hex(snapshot), "size": len(snapshot), "message_id": str(message_id),
         "target": delivery_target(chat_id, thread_id),
     }
+
+
+def valid_message_id(value):
+    return type(value) in (str, int) and len(str(value)) <= 20 and str(value).isascii() and str(value).isdigit() and int(value) > 0

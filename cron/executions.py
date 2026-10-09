@@ -629,6 +629,10 @@ def _decode_receipt(row):
             or receipt.get('request_key') != key or receipt.get('request_sha256') != digest
             or receipt.get('state') not in ('unsent', 'sending', 'verified', 'failed_certain', 'unknown', 'suppressed')):
         raise ValueError('corrupt artifact receipt anchor')
+    if receipt['state'] == 'verified':
+        from cron.artifact_proof import evidence as validate_evidence
+
+        validate_evidence(receipt.get('evidence'), receipt)
     return receipt
 
 
@@ -711,62 +715,20 @@ _RECEIPT_OUTCOME = {
     'unsent': 'unknown', 'sending': 'unknown', 'unknown': 'unknown',
     'verified': 'delivered', 'suppressed': 'suppressed', 'failed_certain': 'failed',
 }
-# Evidence stores IDs/hashes/targets and nothing else: a durable receipt must never
-# retain a report body, a local path or a credential.
-_EVIDENCE_BANNED_KEYS = frozenset({
-    'path', 'file', 'filepath', 'filename', 'bytes', 'body', 'message', 'content', 'text',
-    'token', 'secret', 'password', 'credential', 'key',
-})
-_EVIDENCE_MAX_FIELDS = 64
-_EVIDENCE_MAX_CHARS = 65536
 
 
 def _receipt_delivery_outcome(row, delivery_outcome):
     """Receipt-derived disposition. A settled receipt is authoritative; an in-flight one
     only fills a caller that had nothing to record."""
-    if not row or not row.get('delivery_receipt'):
+    if not row or row.get('delivery_receipt') is None:
         return delivery_outcome
     try:
         receipt = _decode_receipt(row)
-    except ValueError:
-        return delivery_outcome
+    except (ValueError, TypeError, KeyError):
+        return 'unknown'
     if receipt['state'] in ('unsent', 'sending'):
-        return delivery_outcome if delivery_outcome is not None else 'unknown'
+        return 'unknown'
     return _RECEIPT_OUTCOME[receipt['state']]
-
-
-def _validate_delivery_evidence(value, depth=0) -> None:
-    """Reject evidence that could retain a body, a local path or a credential."""
-    if depth > 6 or isinstance(value, (str, bytes, bytearray)) and len(value) > 4096:
-        raise ValueError('invalid artifact evidence value')
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return
-    if isinstance(value, (list, tuple)):
-        if len(value) > _EVIDENCE_MAX_FIELDS:
-            raise ValueError('artifact evidence is unbounded')
-        for item in value:
-            _validate_delivery_evidence(item, depth + 1)
-        return
-    if isinstance(value, dict):
-        if len(value) > _EVIDENCE_MAX_FIELDS:
-            raise ValueError('artifact evidence is unbounded')
-        for field, item in value.items():
-            if not isinstance(field, str) or field.lower() in _EVIDENCE_BANNED_KEYS:
-                raise ValueError('artifact evidence must not retain bodies, paths or credentials')
-            _validate_delivery_evidence(item, depth + 1)
-        return
-    raise ValueError('invalid artifact evidence value')
-
-
-def _checked_evidence(evidence) -> Optional[dict]:
-    if evidence is None:
-        return None
-    if not isinstance(evidence, dict):
-        raise ValueError('artifact evidence must be a mapping')
-    _validate_delivery_evidence(evidence)
-    if len(json.dumps(evidence)) > _EVIDENCE_MAX_CHARS:
-        raise ValueError('artifact evidence is unbounded')
-    return evidence
 
 
 def delivery_profile_sha256() -> str:
@@ -790,12 +752,15 @@ def settle_delivery_request(
 
     if state not in _DELIVERY_SETTLED_STATES:
         raise ValueError('invalid artifact receipt state')
+    if state in ('failed_certain', 'suppressed') and evidence is not None:
+        raise ValueError('no-send disposition cannot retain acceptance evidence')
+    if state == 'failed_certain' and reason != 'gateway loop unavailable before dispatch':
+        raise ValueError('failed_certain requires proven pre-dispatch refusal')
     if not isinstance(attempt_nonce, str) or not attempt_nonce:
         raise ValueError('artifact settlement requires the claim attempt nonce')
     if reason is not None and (not isinstance(reason, str) or len(reason) > 300):
         raise ValueError('invalid artifact settlement reason')
     _hex(request_sha256, 64)
-    evidence = _checked_evidence(evidence)
     with _transaction(immediate=True) as conn:
         row = _fetch(conn, str(execution_id))
         if not row or not row.get('delivery_receipt'):
@@ -805,16 +770,22 @@ def settle_delivery_request(
             raise ValueError('artifact request digest conflict')
         if receipt['state'] != 'sending' or receipt.get('attempt_nonce') != attempt_nonce:
             return None
-        if profile_sha256 is not None and receipt.get('sender_profile_sha256') != profile_sha256:
+        if (receipt.get('sender_pid') != os.getpid()
+                or receipt.get('sender_profile_sha256') != delivery_profile_sha256()
+                or profile_sha256 is not None and receipt.get('sender_profile_sha256') != profile_sha256):
             return None
+        from cron.artifact_proof import evidence as validate_evidence
+
+        if state == 'verified' or evidence is not None:
+            validate_evidence(evidence, receipt)
         receipt.update(state=state, settled_at=_hermes_now().isoformat())
         if evidence is not None:
             receipt['evidence'] = evidence
         if reason is not None:
             receipt['reason'] = reason
         changed = conn.execute(
-            'UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
-            (json.dumps(receipt), row['id'], row['delivery_receipt'])).rowcount
+            'UPDATE executions SET delivery_receipt=?, delivery_outcome=? WHERE id=? AND delivery_receipt=?',
+            (json.dumps(receipt), _RECEIPT_OUTCOME[state], row['id'], row['delivery_receipt'])).rowcount
         if changed != 1:
             return None
         return receipt
@@ -822,6 +793,7 @@ def settle_delivery_request(
 
 def reconcile_delivery_request(
     execution_id: str, request_sha256: str, *, attempt_nonce: Optional[str] = None,
+    job_id: Optional[str] = None,
 ) -> Optional[dict]:
     """Reread the receipt for one exact attempt under the owning profile — never mutates.
 
@@ -835,6 +807,8 @@ def reconcile_delivery_request(
         row = _fetch(conn, str(execution_id))
     if not row or not row.get('delivery_receipt'):
         return None
+    if job_id is not None and row['job_id'] != job_id:
+        raise ValueError('artifact execution job conflict')
     receipt = _decode_receipt(row)
     if receipt['request_sha256'] != request_sha256:
         raise ValueError('artifact request digest conflict')

@@ -278,3 +278,61 @@ it again. Provider receipts distinguish that saved input digest from formatted
 chunk/payload digests. The full artifact remains separate private evidence under
 the existing media policy. A live or unverifiable owner is fenced until an
 operator resolves it; the dead-owner recovery does not reclaim a wedged live PID.
+
+## Direct sender implementation ruling (9 October 2026)
+
+The opted-in route in `scheduler_delivery._deliver_result` enters
+`artifact_transport.deliver_artifact` before response wrapping, redaction and inline
+MEDIA extraction. Its explicit artifact inventory is collected directly from
+`adapter.send_document(snapshot=...)`. The orchestrator approved this direct owner
+on 9 October 2026: `_send_media_via_adapter` remains the unchanged legacy MEDIA
+owner; an unused receipt collector there is unnecessary. Every opted-in document
+is collected independently from the actual native send result. A text artifact
+must equal the exact saved notification bytes and reuses that notification's proof;
+it causes no second text send or native upload.
+
+Actual shared seams for the subsequent queue implementation:
+
+- `artifact_transport.prepare_artifact_request(job)` returns
+  `(validated_envelope, resolved_target, snapshots, receipt)` under the owned active
+  execution. Snapshots are ephemeral byte data; serialize only canonical receipt
+  identity/reference metadata. A returned prior execution anchor fences enqueue.
+- `snapshot_request(envelope)` rechecks path policy and captures each artifact once.
+  `build_request_identity(envelope, target, snapshots=None)` validates the ordered
+  snapshot inventory and derives sizes from retained bytes, never later path stats.
+- `executions.reconcile_delivery_request(execution_id, request_sha256, *,
+  attempt_nonce=None, job_id=None)` reads that exact anchor under the owning profile.
+  None means absent; conflicting job/digest/nonce raises. Gateway senders use this
+  stored anchor and do not prepare a replacement under their process identity.
+- `artifact_transport._dispatch(transport, config, chat_id, thread_id, message,
+  snapshots, metadata)` sends once and returns notification/artifact results.
+  `_settle(execution_id, request_sha256, attempt_nonce, profile_sha256, message,
+  target, notification_result, artifact_results)` validates the full stored inventory
+  and settles the exact attempt. Its tuple is internal; `deliver_artifact` exposes
+  only None after durable verification, or an explicit disposition string.
+- `_install_late_callback(future, *, execution_id, request_sha256, attempt_nonce,
+  profile_sha256, message, target)` captures the actual Context, under the owning
+  `_profile_cron_scope`, and retains the future through completion. Exceptions stay
+  unknown. Exact late verification updates only delivery disposition, including a
+  terminal execution row; it never changes run success or error.
+
+`cron.artifact_proof` owns the closed evidence schema. Notification proofs carry
+provider, native method (`send_message` or `sendRichMessage`), incoming digest/byte
+size, actual target, complete count and ordered index/hash/provider IDs. Rich
+proofs also bind the submitted payload hash. Document proofs carry provider,
+`send_document`, full snapshot hash/size, actual target and provider ID. Stored
+proof inventory must equal every ordered canonical kind/transport entry. IDs are
+positive ASCII decimal strings; bool/float counts or indices and arbitrary extra
+fields cannot verify. Evidence is bounded to 64 notification chunks; greater
+counts remain unverified. Markdown plain fallback hashes the actual submitted
+plain bytes. Thread fallback cannot attest the requested thread. Missing IDs,
+failed SendResults, partial/omitted/extra proof and settlement without evidence
+remain fenced. A corrupted receipt cannot grant positive finish disposition.
+
+This ruling covers direct live delivery only. Queue adoption, drain, terminal and
+late tombstone reconciliation remain the separately audited queue task. No live
+activation, sends, source-policy or Sites-gate change is implied.
+
+A missing chunk ID after earlier accepted chunks preserves the adapter's partial-send
+metadata with no certain-unsent tail. Missing acceptance IDs are non-retryable;
+provider acceptance may already have occurred.

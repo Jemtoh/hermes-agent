@@ -89,8 +89,8 @@ class _FakeAdapter:
         size = max(1, len(content) // self.chunks)
         pieces = [content[i * size:(i + 1) * size] for i in range(self.chunks)]
         return {"success": True, "message_id": "100", "raw_response": {"delivery_receipt": {
-            "role": "notification", "provider": "telegram", "complete": True,
-            "count": len(pieces), "incoming_sha256": _sha(content.encode()),
+            "role": "notification", "provider": "telegram", "method": "send_message", "complete": True,
+            "count": len(pieces), "incoming_size": len(content.encode()), "incoming_sha256": _sha(content.encode()),
             "target": _target(chat_id),
             "chunks": [{"index": i, "sha256": _sha(piece.encode()), "message_id": str(100 + i)}
                        for i, piece in enumerate(pieces)]}}}
@@ -140,9 +140,9 @@ def test_complete_provider_evidence_settles_verified(monkeypatch, live_loop, env
     receipt = _receipt(state_only=False)
     assert receipt["state"] == "verified"
     assert receipt["evidence"]["notification"]["count"] == 2
-    assert receipt["evidence"]["artifacts"] == [
-        {"kind": "report", "sha256": _sha(REPORT), "message_id": "55",
-         "method": "send_document", "size": len(REPORT)}]
+    proof = receipt["evidence"]["artifacts"][0]["proof"]
+    assert proof["sha256"] == _sha(REPORT) and proof["message_id"] == "55"
+    assert proof["method"] == "send_document" and proof["size"] == len(REPORT)
     stored = json.dumps(receipt)
     assert str(envelope["artifacts"][0]["path"]) not in stored
     assert "untrusted/prose.txt" not in stored
@@ -237,3 +237,139 @@ def test_deliver_result_routes_opt_in_and_leaves_the_failure_lane_alone(monkeypa
     assert scheduler_delivery._deliver_result(
         {"id": "fake-report", "deliver": "local", "_artifact_delivery": envelope}, "body",
         for_failure=True) is None
+
+
+def test_text_artifact_uses_exact_notice_once_without_document(monkeypatch, live_loop, envelope, artifact):
+    monkeypatch.setattr('gateway.config.load_gateway_config', _config)
+    artifact.write_bytes(NOTICE.encode())
+    envelope['artifacts'][0].update(sha256=_sha(NOTICE.encode()), transport='text')
+    execution = e.create_execution('fake-report', source='builtin')
+    adapter = _FakeAdapter()
+    assert t.deliver_artifact(_job(envelope, execution['id']),
+                              adapters={Platform.TELEGRAM: adapter}, loop=live_loop) is None
+    assert adapter.sent == [NOTICE] and adapter.documents == []
+    assert _receipt() == 'verified'
+
+
+def test_mutated_notice_refuses_at_actual_sender(monkeypatch, live_loop, envelope):
+    monkeypatch.setattr('gateway.config.load_gateway_config', _config)
+    execution = e.create_execution('fake-report', source='builtin')
+    envelope['message'] += 'mutated after parse'
+    adapter = _FakeAdapter()
+    assert 'digest mismatch' in t.deliver_artifact(_job(envelope, execution['id']),
+                                                 adapters={Platform.TELEGRAM: adapter}, loop=live_loop)
+    assert adapter.sent == [] and adapter.documents == []
+
+
+def test_new_execution_fenced_by_prior_verified_anchor(monkeypatch, live_loop, envelope):
+    monkeypatch.setattr('gateway.config.load_gateway_config', _config)
+    first = e.create_execution('fake-report', source='builtin')
+    adapter = _FakeAdapter()
+    assert t.deliver_artifact(_job(envelope, first['id']),
+                              adapters={Platform.TELEGRAM: adapter}, loop=live_loop) is None
+    e.finish_execution(first['id'], success=True)
+    second = e.create_execution('fake-report', source='builtin')
+    refused = t.deliver_artifact(_job(envelope, second['id']),
+                                adapters={Platform.TELEGRAM: adapter}, loop=live_loop)
+    assert 'not resent' in refused and 'state=verified' in refused and 'anchor is missing' not in refused
+    assert len(adapter.sent) == len(adapter.documents) == 1
+
+
+def test_identity_size_comes_from_captured_snapshot(envelope, artifact):
+    snapshots = t.snapshot_request(envelope)
+    artifact.write_bytes(b'replaced after capture')
+    assert t.build_request_identity(envelope, _target(), snapshots)['artifacts'][0]['size'] == len(REPORT)
+
+
+def test_settle_missing_artifact_results_is_unknown(envelope):
+    execution = e.create_execution('fake-report', source='builtin')
+    prepared = e.prepare_delivery_request(execution['id'], execution['job_id'],
+                                         t.build_request_identity(envelope, _target()))
+    claim = e.claim_delivery_request(execution['id'], prepared['request_sha256'])
+    result = asyncio.run(_FakeAdapter().send('123', NOTICE))
+    assert t._settle(execution['id'], claim['request_sha256'], claim['attempt_nonce'],
+                     claim['sender_profile_sha256'], NOTICE, _target(), result, [])[0] is False
+    assert _receipt() == 'unknown'
+
+
+def test_late_callback_binds_actual_owning_profile(tmp_path, monkeypatch, envelope):
+    from concurrent.futures import Future
+    from cron.scheduler_provider import _profile_cron_scope
+
+    monkeypatch.setattr(e, 'EXECUTIONS_FILE', None)
+    home_a, home_b = tmp_path / 'a', tmp_path / 'b'
+    with _profile_cron_scope(home_a):
+        execution = e.create_execution('fake-report', source='builtin')
+        prepared = e.prepare_delivery_request(execution['id'], execution['job_id'],
+                                             t.build_request_identity(envelope, _target()))
+        claim = e.claim_delivery_request(execution['id'], prepared['request_sha256'])
+        future = Future()
+        assert t._install_late_callback(future, execution_id=execution['id'],
+                                        request_sha256=claim['request_sha256'],
+                                        attempt_nonce=claim['attempt_nonce'],
+                                        profile_sha256=claim['sender_profile_sha256'], message=NOTICE, target=_target())
+        assert not t._install_late_callback(future, execution_id=execution['id'],
+                                            request_sha256=claim['request_sha256'],
+                                            attempt_nonce=claim['attempt_nonce'],
+                                            profile_sha256=claim['sender_profile_sha256'], message=NOTICE, target=_target())
+        e.finish_execution(execution['id'], success=False, delivery_outcome='unknown')
+    adapter = _FakeAdapter()
+    notice = asyncio.run(adapter.send('123', NOTICE))
+    document = asyncio.run(adapter.send_document('123', snapshot=REPORT))
+    with _profile_cron_scope(home_b):
+        future.set_result((notice, [(t.snapshot_request(envelope)[0], document)]))
+        assert e.get_execution(execution['id']) is None
+    with _profile_cron_scope(home_a):
+        assert _receipt() == 'verified'
+        assert e.get_execution(execution['id'])['delivery_outcome'] == 'delivered'
+
+
+def test_late_future_exception_records_unknown(envelope):
+    from concurrent.futures import Future
+    execution = e.create_execution('fake-report', source='builtin')
+    prepared = e.prepare_delivery_request(execution['id'], execution['job_id'],
+                                         t.build_request_identity(envelope, _target()))
+    claim = e.claim_delivery_request(execution['id'], prepared['request_sha256'])
+    future = Future()
+    t._install_late_callback(future, execution_id=execution['id'], request_sha256=claim['request_sha256'],
+                            attempt_nonce=claim['attempt_nonce'],
+                            profile_sha256=claim['sender_profile_sha256'], message=NOTICE, target=_target())
+    future.set_exception(RuntimeError('fake provider connection loss'))
+    assert _receipt() == 'unknown'
+
+
+def test_suppressed_dispatch_records_honest_disposition(monkeypatch, live_loop, envelope):
+    from gateway.delivery import DeliveryRouter
+    from unittest.mock import AsyncMock
+    monkeypatch.setattr('gateway.config.load_gateway_config', _config)
+    monkeypatch.setattr(DeliveryRouter, '_deliver_to_platform', AsyncMock(return_value={
+        'success': True, 'delivered': False, 'filtered': 'silence_narration'}))
+    execution = e.create_execution('fake-report', source='builtin')
+    adapter = _FakeAdapter()
+    assert t.deliver_artifact(_job(envelope, execution['id']),
+                              adapters={Platform.TELEGRAM: adapter}, loop=live_loop) == 'artifact delivery suppressed; not sent'
+    assert adapter.sent == [] and adapter.documents == []
+    assert _receipt() == 'suppressed'
+
+
+def test_exact_receipt_reader_checks_job_id(envelope):
+    execution = e.create_execution('fake-report', source='builtin')
+    prepared = e.prepare_delivery_request(execution['id'], execution['job_id'],
+                                         t.build_request_identity(envelope, _target()))
+    with pytest.raises(ValueError, match='job conflict'):
+        e.reconcile_delivery_request(execution['id'], prepared['request_sha256'], job_id='other-job')
+
+
+def test_failed_send_result_cannot_verify_forged_complete_proof(envelope):
+    execution = e.create_execution('fake-report', source='builtin')
+    prepared = e.prepare_delivery_request(execution['id'], execution['job_id'],
+                                         t.build_request_identity(envelope, _target()))
+    claim = e.claim_delivery_request(execution['id'], prepared['request_sha256'])
+    adapter = _FakeAdapter()
+    notice = asyncio.run(adapter.send('123', NOTICE))
+    document = asyncio.run(adapter.send_document('123', snapshot=REPORT))
+    document['success'] = False
+    assert t._settle(execution['id'], claim['request_sha256'], claim['attempt_nonce'],
+                     claim['sender_profile_sha256'], NOTICE, _target(), notice,
+                     [(t.snapshot_request(envelope)[0], document)])[0] is False
+    assert _receipt() == 'unknown'

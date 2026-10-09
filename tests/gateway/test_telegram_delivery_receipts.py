@@ -37,7 +37,9 @@ def adapter() -> TelegramAdapter:
 async def test_send_chunks_receipt_names_every_chunk_in_order(adapter):
     ids = iter(["11", "12", "13"])
 
-    async def _fake_send(chat_id, chunk, index, reply_to, metadata, thread_id, used, error_types):
+    async def _fake_send(chat_id, chunk, index, reply_to, metadata, thread_id, used, error_types, submitted=None):
+        if submitted is not None:
+            submitted.append({'sha256': _sha(chunk.encode()), 'thread_id': None})
         return SimpleNamespace(message_id=next(ids)), False
 
     adapter._send_chunk_with_retries = _fake_send
@@ -57,7 +59,7 @@ async def test_send_chunks_receipt_names_every_chunk_in_order(adapter):
 
 @pytest.mark.asyncio
 async def test_send_chunks_without_incoming_keeps_the_legacy_shape(adapter):
-    async def _fake_send(chat_id, chunk, index, reply_to, metadata, thread_id, used, error_types):
+    async def _fake_send(chat_id, chunk, index, reply_to, metadata, thread_id, used, error_types, submitted=None):
         return SimpleNamespace(message_id="21"), False
 
     adapter._send_chunk_with_retries = _fake_send
@@ -88,7 +90,7 @@ async def test_native_document_send_proves_the_exact_snapshot(adapter, tmp_path)
 
     async def _capture(**kwargs):
         uploaded["bytes"] = kwargs["document"].read()
-        return SimpleNamespace(message_id=99)
+        return SimpleNamespace(message_id=99, message_thread_id=7)
 
     adapter._bot.send_document = AsyncMock(side_effect=_capture)
 
@@ -125,3 +127,69 @@ async def test_document_without_a_snapshot_keeps_the_legacy_shape(adapter, tmp_p
     adapter._bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=7))
     result = await adapter.send_document(chat_id="12345", file_path=str(path))
     assert result.success is True and result.raw_response is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('provider_id', [None, '', 'None', False])
+async def test_missing_chunk_id_never_builds_proof(adapter, provider_id):
+    adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=provider_id))
+    result = await adapter._send_chunks('12345', ['one'], [], None, {}, adapter._telegram_error_types(),
+                                        incoming='one')
+    assert result.success is False and not result.raw_response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('provider_id', [None, '', 'None', False])
+async def test_missing_document_id_never_builds_proof(adapter, tmp_path, provider_id):
+    adapter._bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=provider_id))
+    result = await adapter.send_document('12345', str(tmp_path / 'not-opened'), snapshot=b'body')
+    assert result.success is False and not result.raw_response
+
+
+@pytest.mark.asyncio
+async def test_plain_fallback_receipt_hashes_actual_submitted_text(adapter):
+    calls = []
+
+    async def send(**kwargs):
+        calls.append(kwargs['text'])
+        if len(calls) == 1:
+            raise RuntimeError('markdown parse rejected')
+        return SimpleNamespace(message_id=27)
+
+    adapter._bot.send_message = AsyncMock(side_effect=send)
+    result = await adapter._send_chunks('12345', [r'hello\!'], [], None, {}, adapter._telegram_error_types(),
+                                        incoming='hello!')
+    proof = result.raw_response['delivery_receipt']
+    assert calls == [r'hello\!', 'hello!']
+    assert proof['chunks'][0]['sha256'] == _sha(calls[-1].encode())
+
+
+@pytest.mark.asyncio
+async def test_thread_fallback_never_attests_requested_thread(adapter):
+    async def fallback(chat_id, chunk, index, reply_to, metadata, thread_id, used, error_types, submitted=None):
+        submitted.append({'sha256': _sha(chunk.encode()), 'thread_id': None})
+        return SimpleNamespace(message_id=31), True
+
+    adapter._send_chunk_with_retries = fallback
+    result = await adapter._send_chunks('-10012345', ['one'], [], None, {'thread_id': '7'}, (), incoming='one')
+    assert result.success is True and 'delivery_receipt' not in result.raw_response
+
+
+@pytest.mark.asyncio
+async def test_document_proof_names_actual_response_thread(adapter, tmp_path):
+    adapter._bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=34, message_thread_id=None))
+    result = await adapter.send_document('-10012345', str(tmp_path / 'not-opened'), snapshot=b'body',
+                                         metadata={'thread_id': '7'})
+    assert result.raw_response['delivery_receipt']['target']['thread_id'] is None
+
+
+@pytest.mark.asyncio
+async def test_missing_later_chunk_id_keeps_ambiguous_partial_send_fenced(adapter):
+    adapter._bot.send_message = AsyncMock(side_effect=[SimpleNamespace(message_id=7),
+                                                      SimpleNamespace(message_id=None)])
+    result = await adapter._send_chunks('12345', ['one', 'two'], [], None, {}, adapter._telegram_error_types(),
+                                        incoming='onetwo')
+    assert result.success is False and result.retryable is False
+    assert result.raw_response['partial_overflow'] is True
+    assert result.raw_response['delivered_chunks'] == 1
+    assert 'undelivered_chunks' not in result.raw_response and 'delivery_receipt' not in result.raw_response

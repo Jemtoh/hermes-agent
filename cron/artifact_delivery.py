@@ -45,13 +45,17 @@ def _unique_pairs(pairs):
 
 
 def parse_envelope(output):
-    from gateway.platforms.base import validate_media_delivery_path
-    from cron.scheduler_delivery import _redact_cron_payload
-
     try:
         request = json.loads(output, object_pairs_hook=_unique_pairs)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError('invalid artifact envelope JSON') from exc
+    return validate_envelope(request)
+
+
+def validate_envelope(request, *, verify_files=True):
+    from gateway.platforms.base import validate_media_delivery_path
+    from cron.scheduler_delivery import _redact_cron_payload
+
     _keys(request, ('version', 'token', 'purpose', 'message', 'message_sha256', 'artifacts'))
     if type(request['version']) is not int or request['version'] != 1:
         raise ValueError('unsupported artifact envelope version')
@@ -80,6 +84,8 @@ def parse_envelope(output):
         _hex(artifact['sha256'], 64)
         if artifact['transport'] not in ('text', 'document') or not isinstance(artifact['path'], str):
             raise ValueError('invalid artifact transport or path')
+        if not verify_files:
+            continue
         path = validate_media_delivery_path(artifact['path'])
         if path is None:
             raise ValueError('artifact path refused by media policy')

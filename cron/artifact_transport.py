@@ -6,8 +6,8 @@ receipt in ``cron/executions.py`` is the only authority: a request is claimed BE
 first byte leaves, settled once from complete provider evidence, and NEVER replayed after
 an unknown or partial outcome.
 
-Bound scope: direct live-adapter delivery only. Queued/external-worker artifact delivery
-is deliberately fail-closed here and lands in a separate task.
+Direct and external-worker delivery share the same immutable request and receipt.
+The gateway adopts only the worker-owned queue anchor, then captures bytes before claim.
 """
 
 from __future__ import annotations

@@ -1,8 +1,8 @@
 # Verified cron artifact delivery: design and execution plan
 
-Status: independently audited PASS for extension implementation, 9 October 2026. No code or live
-configuration is activated by this document. Runtime base: `f507014905` in the
-maintained fork. Codex owns integration; Hermes audits/implements in isolation.
+Status: runtime implementation independently audited PASS, 9 October 2026. Consumer
+implementation and live opt-in activation remain pending. Runtime foundation:
+`f507014905` in the maintained fork; reviewed queue implementation `cfff9e5e6f`. Codex owns integration; Hermes audits/implements in isolation.
 Operator authorization: complete remaining fundraising cron phases. Consumer B2
 bindings and atomic cutover are separate prerequisites; no Notion property,
 source/amount policy, monetary migration or Sites gate changes.
@@ -469,3 +469,10 @@ their legacy queue outcomes cannot borrow report receipts or affect the caller.
 Sender settlement uses the existing fingerprint comparator with tolerance=0; its
 liveness default tolerates drift and cannot prove the exact sending incarnation.
 An independently reproduced one-unit changed start is refused before verification.
+
+Final independent verification, 9 October2026: Codex root55 targeted regressions,
+114 adapter/receipt/native/rich/profile caller tests, fullcron1640PASS12platform
+skips; normal11repositorychecks. Independent Codex13behavioralprobesPASS;
+offlineHermeswholequeuePASS plus exactsenderfingerprint supplementPASS. Runtime
+receipt is authority; no real test message or paid review was executed. Live
+consumer opt-in remains a separate compatible four-job cutover after C/D acceptance.

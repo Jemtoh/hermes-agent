@@ -10,6 +10,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import json
+import sqlite3
 import threading
 import time
 from unittest.mock import MagicMock
@@ -549,3 +550,261 @@ def test_failed_certain_maps_to_failed_and_no_evidence_stays_unknown(envelope):
         reason="artifact transport unavailable before dispatch")
     assert q._finish(second["id"], error=None) is True
     assert q.get_status(second["id"])["status"] == "failed"
+
+
+# ------------------------------------------------- 6. acceptance-regression extensions
+def test_existing_corrupt_payload_is_refused_not_adopted(envelope):
+    """A stored row whose OWN payload disagrees with the receipt is never adopted.
+
+    The forged row is internally consistent (envelope digest matches its content), so only the
+    comparison against the durable receipt — not against the incoming job — can catch it.
+    """
+    execution = e.create_execution("fake-report", source="builtin")
+    job = _prepared(envelope, execution)
+    assert q.enqueue(execution["id"], job, NOTICE)["status"] == "pending"
+
+    swapped = b"swapped after the row was written"
+    forged = {**job, "_artifact_delivery": {**envelope, "message": swapped.decode(),
+                                            "message_sha256": _sha(swapped)}}
+    with sqlite3.connect(str(q.DELIVERY_DB)) as conn:
+        conn.execute("UPDATE deliveries SET job_json=?, content=? WHERE execution_id=?",
+                     (json.dumps(forged, ensure_ascii=False, sort_keys=True),
+                      swapped.decode(), execution["id"]))
+
+    refused = q.enqueue(execution["id"], job, NOTICE)
+    assert refused["status"] == "failed" and refused["error"]
+    assert q.get_status(execution["id"])["status"] == "pending"
+    assert _state(execution["id"]) == "unsent"
+
+
+def test_failure_alert_carrying_an_anchor_cannot_adopt_the_artifact_row(envelope):
+    """``for_failure=True`` is always the legacy route, anchor or not, and never adopts the slot."""
+    execution = e.create_execution("fake-report", source="builtin")
+    job = _prepared(envelope, execution)
+    assert q.enqueue(execution["id"], job, NOTICE)["status"] == "pending"
+
+    carried = q.enqueue(execution["id"], job, "failure alert text", for_failure=True)
+    assert carried["status"] == "failed" and "legacy" in carried["error"]
+    bare = q.enqueue(execution["id"], {"id": job["id"]}, "failure alert text", for_failure=True)
+    assert bare["status"] == "failed" and "legacy" in bare["error"]
+    assert q.get_status(execution["id"])["status"] == "pending"
+    assert _state(execution["id"]) == "unsent"
+
+
+def test_legacy_delivery_cannot_adopt_an_admitted_tombstone(
+        envelope, monkeypatch, live_loop):
+    monkeypatch.setattr("gateway.config.load_gateway_config", _config)
+    monkeypatch.setattr(q, "MAX_TERMINAL_DELIVERIES", 0)
+    execution = e.create_execution("fake-report", source="builtin")
+    job = _prepared(envelope, execution)
+    q.enqueue(execution["id"], job, NOTICE)
+    adapter = _FakeAdapter()
+    assert q.drain(_send(adapter, live_loop)) == 1
+    assert q.get_status(execution["id"])["status"] == "delivered"   # tombstone only
+
+    refused = q.enqueue(execution["id"], {"id": job["id"]}, "failure alert text",
+                        for_failure=True)
+    assert refused["status"] == "failed" and "legacy" in refused["error"]
+    assert q.get_status(execution["id"])["status"] == "delivered"
+
+
+def test_prepared_receipt_cannot_adopt_an_unadmitted_legacy_terminal_row(envelope):
+    """A receipt prepared on a legacy execution ID never adopts that row's terminal slot."""
+    execution = e.create_execution("fake-report", source="builtin")
+    q.enqueue(execution["id"], {"id": "invented"}, "invented legacy content")
+    q.claim_next()
+    q._finish(execution["id"], error=None, unverified=True)
+    assert q.get_status(execution["id"])["status"] == "unknown"
+
+    job = _prepared(envelope, execution)
+    refused = q.enqueue(execution["id"], job, NOTICE)
+
+    assert refused["status"] == "failed" and "provenance" in refused["error"]
+    assert q.get_status(execution["id"])["status"] == "unknown"
+    assert q.get_status(execution["id"])["job_json"] == "{}"
+
+
+def test_contended_claim_of_an_admitted_row_sends_once(envelope):
+    execution = e.create_execution("fake-report", source="builtin")
+    job = _prepared(envelope, execution)
+    q.enqueue(execution["id"], job, NOTICE)
+    ready = threading.Barrier(2)
+
+    def _claim():
+        ready.wait(timeout=5)
+        return q.claim_next()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        claimed = list(pool.map(lambda _: _claim(), range(2)))
+
+    assert sum(1 for row in claimed if row is not None) == 1
+
+
+def test_old_failed_certain_pending_row_never_dispatches_after_a_new_attempt(
+        envelope, monkeypatch, live_loop):
+    monkeypatch.setattr("gateway.config.load_gateway_config", _config)
+    first = e.create_execution("fake-report", source="builtin")
+    old = _prepared(envelope, first)
+    q.enqueue(first["id"], old, NOTICE)
+    e.settle_undispatched_delivery_request(
+        first["id"], old["_artifact_anchor"]["request_sha256"],
+        reason="artifact snapshot or path policy refused before dispatch")
+
+    second = e.create_execution("fake-report", source="builtin")
+    new = _prepared(envelope, second)
+    assert new["_artifact_anchor"]["execution_id"] == second["id"]
+
+    adapter = _FakeAdapter()
+    assert q.drain(_send(adapter, live_loop)) == 0
+    assert adapter.sent == [] and adapter.documents == []
+    assert q.get_status(first["id"])["status"] == "failed"
+
+
+def test_failed_certain_is_only_a_proven_no_send(envelope):
+    """A no-send disposition needs a code-owned refusal, and can never retain evidence."""
+    first = e.create_execution("fake-report", source="builtin")
+    job = _prepared(envelope, first)
+    sha = job["_artifact_anchor"]["request_sha256"]
+
+    with pytest.raises(ValueError):
+        e.settle_undispatched_delivery_request(first["id"], sha, reason="something went wrong")
+    assert _state(first["id"]) == "unsent"
+
+    claim = e.claim_delivery_request(first["id"], sha)
+    with pytest.raises(ValueError):
+        e.settle_delivery_request(first["id"], sha, attempt_nonce=claim["attempt_nonce"],
+                                  state="failed_certain",
+                                  reason="gateway loop unavailable before dispatch",
+                                  evidence=_evidence(claim))
+    assert _state(first["id"]) == "sending"      # neither attempt settled anything
+
+    second = e.create_execution("fake-report", source="builtin")
+    retry = _prepared({**envelope, "token": "b" * 32}, second)
+    settled = e.settle_undispatched_delivery_request(
+        second["id"], retry["_artifact_anchor"]["request_sha256"],
+        reason="artifact transport unavailable before dispatch")
+    assert settled["state"] == "failed_certain" and "evidence" not in settled
+
+
+# ------------------------------------------- 7. root acceptance probes (9 October 2026)
+# The four canonical root probes, kept with their own assertions intact. Their canonical
+# out-of-tree copy lives outside this repo; they are owned regressions here so the queue
+# acceptance contract cannot regress without a red test in this file.
+def test_changed_incoming_payload_cannot_adopt_existing_pending(envelope):
+    ex = e.create_execution("invented", source="test")
+    job = _prepared(envelope, ex)
+    q.enqueue(ex["id"], job, NOTICE)
+    bad = json.loads(json.dumps(job))
+    bad["_artifact_delivery"]["message"] = "different saved content"
+    result = q.enqueue(ex["id"], bad, "different saved content")
+    assert result["status"] == "failed", result["status"]
+
+
+def test_receipt_first_crash_gap_redacted_unknown_row_reconciles_on_read(envelope):
+    ex = e.create_execution("invented", source="test")
+    job = _prepared(envelope, ex)
+    q.enqueue(ex["id"], job, NOTICE)
+    q.claim_next()
+    q._terminalize_wait_timeout(ex["id"])
+    claim = e.claim_delivery_request(ex["id"], job["_artifact_anchor"]["request_sha256"])
+    e.settle_delivery_request(ex["id"], claim["request_sha256"],
+                              attempt_nonce=claim["attempt_nonce"], state="verified",
+                              profile_sha256=claim["sender_profile_sha256"],
+                              evidence=_evidence(claim))
+    result = q.get_status(ex["id"])
+    assert result["status"] == "delivered", result["status"]
+    assert result.get("job_json", "{}") == "{}"
+
+
+def test_optin_cannot_adopt_legacy_unknown_tombstone(envelope, monkeypatch):
+    ex = e.create_execution("invented", source="test")
+    monkeypatch.setattr(q, "MAX_TERMINAL_DELIVERIES", 0)
+    q.enqueue(ex["id"], {"id": "invented"}, "invented legacy content")
+    q.claim_next()
+    q._finish(ex["id"], error=None, unverified=True)
+    job = _prepared(envelope, ex)
+    result = q.enqueue(ex["id"], job, NOTICE)
+    assert result["status"] == "failed", result["status"]
+
+
+def test_reused_sender_pid_with_changed_start_cannot_settle_verified(envelope, monkeypatch):
+    ex = e.create_execution("invented", source="test")
+    job = _prepared(envelope, ex)
+    claim = e.claim_delivery_request(ex["id"], job["_artifact_anchor"]["request_sha256"])
+    monkeypatch.setattr(e, "_process_start_time", lambda pid: "invented changed process incarnation")
+    result = e.settle_delivery_request(ex["id"], claim["request_sha256"],
+                                       attempt_nonce=claim["attempt_nonce"], state="verified",
+                                       profile_sha256=claim["sender_profile_sha256"],
+                                       evidence=_evidence(claim))
+    assert result is None
+
+
+def test_pending_retry_repairs_interrupted_admission(envelope):
+    execution = e.create_execution("invented", source="test")
+    job = _prepared(envelope, execution)
+    # Reproduce the former crash window: a valid row committed without its marker.
+    with q._transaction() as conn:
+        conn.execute("INSERT INTO deliveries (execution_id,job_json,content,status,created_at) VALUES (?,?,?,'pending',?)",
+                     (execution["id"], json.dumps(job), NOTICE, "2026-10-09T00:00:00+00:00"))
+    assert q.enqueue(execution["id"], job, NOTICE)["status"] == "pending"
+    assert e.execution_delivery_receipt(execution["id"])["queue_admitted"] is True
+
+
+def test_failed_admission_provenance_exposes_no_queue_work(envelope, monkeypatch):
+    execution = e.create_execution("invented", source="test")
+    job = _prepared(envelope, execution)
+    monkeypatch.setattr(e, "mark_queue_admitted", lambda *args, **kwargs: False)
+    with pytest.raises(ValueError, match="admission could not be persisted"):
+        q.enqueue(execution["id"], job, NOTICE)
+    assert q.get_status(execution["id"]) is None
+
+
+@pytest.mark.parametrize("changed", ["message", "target"])
+def test_terminal_adoption_rejects_changed_actual_request(envelope, changed):
+    execution = e.create_execution("invented", source="test")
+    job = _prepared(envelope, execution)
+    q.enqueue(execution["id"], job, NOTICE)
+    q.claim_next()
+    claim = e.claim_delivery_request(execution["id"], job["_artifact_anchor"]["request_sha256"])
+    e.settle_delivery_request(execution["id"], claim["request_sha256"],
+                             attempt_nonce=claim["attempt_nonce"], state="verified", evidence=_evidence(claim))
+    q._finish(execution["id"], error=None)
+    incoming = json.loads(json.dumps(job))
+    if changed == "message":
+        incoming["_artifact_delivery"]["message"] = "changed with stale digest"
+    else:
+        incoming["origin"]["chat_id"] = "999"
+    assert q.enqueue(execution["id"], incoming, NOTICE)["status"] == "failed"
+
+
+def test_failure_lane_copies_job_without_artifact_authority(envelope):
+    execution = e.create_execution("invented", source="test")
+    job = _prepared(envelope, execution)
+    q.enqueue(execution["id"], job, "failure notice", for_failure=True)
+    sent = []
+    def send(queued, content, for_failure):
+        assert for_failure and "_artifact_anchor" not in queued and "_artifact_delivery" not in queued
+        sent.append(content)
+    q.drain(send)
+    assert sent == ["failure notice"]
+    assert q.get_status(execution["id"])["status"] == "delivered"
+    assert "_artifact_anchor" in job
+
+
+def test_legacy_insertion_cannot_take_reserved_artifact_slot(envelope):
+    execution = e.create_execution("invented", source="test")
+    job = _prepared(envelope, execution)
+    # Receipt admission survives a rolled-back queue transaction.
+    assert e.mark_queue_admitted(execution["id"], job["_artifact_anchor"]["request_sha256"])
+    assert q.enqueue(execution["id"], job, "failure notice", for_failure=True)["status"] == "failed"
+    assert q.get_status(execution["id"]) is None
+
+
+def test_sender_incarnation_requires_exact_start(envelope, monkeypatch):
+    execution = e.create_execution("invented", source="test")
+    job = _prepared(envelope, execution)
+    claim = e.claim_delivery_request(execution["id"], job["_artifact_anchor"]["request_sha256"])
+    monkeypatch.setattr(e, "_process_start_time", lambda pid: int(claim["sender_started_at"]) + 1)
+    assert e.settle_delivery_request(execution["id"], claim["request_sha256"],
+                                    attempt_nonce=claim["attempt_nonce"], state="verified",
+                                    evidence=_evidence(claim)) is None

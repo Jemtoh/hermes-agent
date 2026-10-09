@@ -152,13 +152,13 @@ def _connect() -> sqlite3.Connection:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     # Pruning is done explicitly by the paths that create terminal
     # rows (_finish / recover_abandoned / _terminalize_wait_timeout);
     # read-only polls must not pay for a full-table UPDATE + COUNT.
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
+    with _lock, transaction(_connect(), immediate=immediate) as conn:
         yield conn
 
 
@@ -178,6 +178,10 @@ _ARTIFACT_UNKNOWN_ERROR = (
 # Receipt states that already decide a queue row: only these may terminalize it.
 _TERMINAL_SETTLED = ("delivered", "failed", "suppressed")
 _ADOPTION_REFUSED = "artifact delivery adoption refused: request anchor or identity mismatch"
+_LEGACY_REFUSED = (
+    "artifact delivery adoption refused: this queue slot belongs to an admitted opted-in "
+    "request and a legacy delivery cannot adopt it"
+)
 
 
 def _anchor_of(job_json) -> Optional[tuple]:
@@ -207,9 +211,9 @@ def _receipt_for(anchor) -> Optional[dict]:
         return None
 
 
-def _settled_outcome(anchor) -> Optional[tuple]:
-    """``(status, error)`` once the receipt is terminal, else ``None`` (still in flight)."""
-    state = (_receipt_for(anchor) or {}).get("state")
+def _settled_from_receipt(receipt) -> Optional[tuple]:
+    """``(status, error)`` once a durable receipt is terminal, else ``None`` (still in flight)."""
+    state = (receipt or {}).get("state")
     if state == "verified":
         return "delivered", None
     if state == "suppressed":
@@ -217,6 +221,11 @@ def _settled_outcome(anchor) -> Optional[tuple]:
     if state == "failed_certain":
         return "failed", "artifact delivery was refused before dispatch; no provider send occurred."
     return None
+
+
+def _settled_outcome(anchor) -> Optional[tuple]:
+    """``(status, error)`` once the receipt is terminal, else ``None`` (still in flight)."""
+    return _settled_from_receipt(_receipt_for(anchor))
 
 
 def _artifact_outcome(anchor, fallback_error) -> tuple:
@@ -231,10 +240,54 @@ def _artifact_outcome(anchor, fallback_error) -> tuple:
     return "unknown", fallback_error or _ARTIFACT_UNKNOWN_ERROR
 
 
+def _queue_admitted(receipt) -> bool:
+    """Whether this exact receipt records that its queue row was ADMITTED by this feature.
+
+    A receipt that was merely PREPARED — or one written on an execution ID whose queue slot
+    belongs to a legacy row or tombstone — carries no such marker, so it can never adopt that
+    slot, however settled it later becomes.
+    """
+    return isinstance(receipt, dict) and receipt.get("queue_admitted") is True
+
+
+def _admitted_receipt(execution_id) -> Optional[dict]:
+    """The durable receipt for an execution whose queue slot this feature admitted, else ``None``."""
+    from cron.executions import execution_delivery_receipt
+
+    try:
+        receipt = execution_delivery_receipt(str(execution_id))
+    except (ValueError, TypeError, KeyError):
+        return None
+    return receipt if _queue_admitted(receipt) else None
+
+
+def _admitted_settled(execution_id) -> Optional[tuple]:
+    """Receipt-proven outcome for a REDACTED row: identity re-derived by exact execution ID.
+
+    Only a queue slot this feature admitted is resolved this way, and a ``verified`` receipt must
+    also carry the claiming attempt nonce and THIS profile's sender identity — so a legacy row or
+    tombstone can never be adopted by a receipt a later run prepared on the same execution ID.
+    """
+    receipt = _admitted_receipt(execution_id)
+    if receipt is None:
+        return None
+    if receipt.get("state") == "verified":
+        from cron.executions import delivery_profile_sha256
+
+        if (not receipt.get("attempt_nonce")
+                or receipt.get("sender_profile_sha256") != delivery_profile_sha256()):
+            return None
+    return _settled_from_receipt(receipt)
+
+
 def _row_settled(row) -> Optional[tuple]:
     """Receipt-proven settled outcome for a queue row, else ``None`` (legacy or in flight)."""
-    anchor = _anchor_of(row["job_json"]) if row is not None else None
-    return _settled_outcome(anchor) if anchor is not None else None
+    if row is None:
+        return None
+    anchor = _anchor_of(row["job_json"])
+    if anchor is not None:
+        return _settled_outcome(anchor)
+    return _admitted_settled(row["execution_id"])
 
 
 def _apply_settled(execution_id: str, settled: tuple, *, statuses) -> bool:
@@ -249,6 +302,15 @@ def _apply_settled(execution_id: str, settled: tuple, *, statuses) -> bool:
         if changed:
             _prune_terminal_unlocked(conn)
     return changed
+
+
+def _decode_job(job_json) -> Optional[dict]:
+    """A parsed job payload, whether it arrived as JSON text or already decoded."""
+    try:
+        job = json.loads(job_json) if isinstance(job_json, str) else job_json
+    except (TypeError, ValueError):
+        return None
+    return job if isinstance(job, dict) else None
 
 
 def _adoption(execution_id, job, content) -> tuple:
@@ -277,11 +339,48 @@ def _adoption(execution_id, job, content) -> tuple:
         receipt = reconcile_delivery_request(target_execution, request_sha256, job_id=job_id)
     except ValueError:
         return True, None, _ADOPTION_REFUSED
-    if receipt is None or receipt.get("request") != request:
-        return True, None, _ADOPTION_REFUSED
-    if not _envelope_matches(job.get("_artifact_delivery"), content, request):
+    if receipt is None or not _payload_matches(job, content, receipt):
         return True, None, _ADOPTION_REFUSED
     return True, receipt, None
+
+
+def _payload_matches(job_json, content, receipt) -> bool:
+    """The carried payload must restate the receipt's canonical identity, INCLUDING its own IDs.
+
+    A copied stale reference is not validation: a job whose own ``id``/``execution_id`` disagree
+    with its anchor — or whose anchor, envelope, authorized target or queued content disagree with
+    the durable receipt — is refused rather than adopted.
+    """
+    job = _decode_job(job_json)
+    if job is None or not isinstance(receipt, dict):
+        return False
+    anchor = job.get("_artifact_anchor")
+    stored = receipt.get("request")
+    if not isinstance(anchor, dict) or not isinstance(anchor.get("request"), dict):
+        return False
+    if not isinstance(stored, dict):
+        return False
+    request = anchor["request"]
+    if (str(anchor.get("execution_id") or "") != str(receipt.get("execution_id") or "")
+            or str(anchor.get("request_sha256") or "") != str(receipt.get("request_sha256") or "")
+            or request != stored):
+        return False
+    if str(job.get("execution_id") or "") != str(anchor.get("execution_id") or ""):
+        return False
+    if str(job.get("id") or "") != str(anchor.get("job_id") or ""):
+        return False
+    from cron.artifact_delivery import validate_envelope
+    from cron.artifact_transport import _targets, _expected_target
+
+    try:
+        validate_envelope(job.get("_artifact_delivery"), verify_files=False)
+        targets = _targets(job)
+        if (len(targets) != 1 or str(targets[0].get("platform", "")).lower() != "telegram"
+                or _expected_target(targets[0]["chat_id"], targets[0].get("thread_id")) != request["target"]):
+            return False
+    except (ValueError, TypeError, KeyError):
+        return False
+    return _envelope_matches(job.get("_artifact_delivery"), content, request)
 
 
 def _envelope_matches(envelope, content, request) -> bool:
@@ -306,8 +405,11 @@ def _envelope_matches(envelope, content, request) -> bool:
 
 def _existing_refusal(existing, job, receipt) -> Optional[str]:
     """``None`` when an existing row may be adopted, else the refusal reason."""
-    derived = _ARTIFACT_STATUS.get((receipt or {}).get("state"))
     if existing["status"] in _TERMINAL:
+        if receipt is None or not _queue_admitted(receipt):
+            return "terminal queue row has no admitted artifact provenance"
+        settled = _settled_from_receipt(receipt)
+        derived = settled[0] if settled is not None else None
         if derived is None:
             return "terminal queue row has no matching durable receipt"
         if existing["status"] in ("unknown", derived):
@@ -316,7 +418,19 @@ def _existing_refusal(existing, job, receipt) -> Optional[str]:
     carried, incoming = _anchor_of(existing["job_json"]), _anchor_of(job)
     if carried is None or incoming is None or carried != incoming:
         return "queued payload anchor does not match the incoming request"
+    if not _payload_matches(existing["job_json"], existing["content"], receipt):
+        return "queued payload does not restate its durable receipt"
     return None
+
+
+def _record_admission(execution_id, receipt) -> None:
+    # Persist provenance before the queue transaction exposes work to another process.
+    from cron.executions import mark_queue_admitted, reconcile_delivery_request
+
+    mark_queue_admitted(execution_id, receipt["request_sha256"])
+    admitted = reconcile_delivery_request(execution_id, receipt["request_sha256"])
+    if not _queue_admitted(admitted):
+        raise ValueError("artifact queue admission could not be persisted")
 
 
 def _refusal(execution_id, reason) -> dict:
@@ -334,14 +448,22 @@ def enqueue(
     """Persist one idempotent delivery request before the worker waits.
 
     An opted-in request is validated against the durable receipt under THIS home before any
-    existing row or tombstone is adopted. A legacy job keeps its current behaviour exactly.
+    existing row or tombstone is adopted. A legacy job keeps its current behaviour exactly —
+    except that it may never read back a queue slot this feature admitted, and a failure alert
+    (``for_failure=True``) is always the legacy route even when it carries a stale anchor.
     """
-    opted, receipt, refusal = _adoption(execution_id, job, content)
+    if for_failure:
+        job = dict(job)
+        job.pop("_artifact_anchor", None)
+        job.pop("_artifact_delivery", None)
+    opted, receipt, refusal = (
+        (False, None, None) if for_failure else _adoption(execution_id, job, content))
     execution_id = str(execution_id)
-    with _transaction() as conn:
-        # Serialize the tombstone check and insert with retention in other
-        # processes, which can move a terminal delivery into the tombstone table.
-        conn.execute("BEGIN IMMEDIATE")
+    if opted and refusal is not None:
+        # A changed message/envelope/target/size must never ride in on an existing row.
+        return _refusal(execution_id, refusal)
+    # Serialize admission against other queue writers, including retention.
+    with _transaction(immediate=True) as conn:
         tombstone = conn.execute(
             "SELECT terminal_status, finished_at FROM delivery_tombstones "
             "WHERE execution_id=?",
@@ -349,14 +471,17 @@ def enqueue(
         ).fetchone()
         if tombstone is not None:
             if not opted:
+                if _admitted_receipt(execution_id) is not None:
+                    return _refusal(execution_id, _LEGACY_REFUSED)
                 return {
                     "execution_id": execution_id,
                     "status": tombstone["terminal_status"],
                     "finished_at": tombstone["finished_at"],
                 }
-            derived = _ARTIFACT_STATUS.get((receipt or {}).get("state"))
-            if refusal is not None or derived is None:
-                return _refusal(execution_id, refusal or _ADOPTION_REFUSED)
+            settled = _settled_from_receipt(receipt)
+            derived = settled[0] if settled is not None else None
+            if derived is None or not _queue_admitted(receipt):
+                return _refusal(execution_id, _ADOPTION_REFUSED)
             if tombstone["terminal_status"] not in ("unknown", derived):
                 return _refusal(execution_id, "terminal tombstone contradicts the durable receipt")
             return {"execution_id": execution_id, "status": derived,
@@ -365,16 +490,23 @@ def enqueue(
             "SELECT * FROM deliveries WHERE execution_id=?", (execution_id,)
         ).fetchone()
         if existing is not None:
-            if opted:
-                reason = _existing_refusal(existing, job, receipt)
-                if reason is not None:
-                    return _refusal(execution_id, reason)
-                settled = _settled_outcome(_anchor_of(job))
-                if settled is not None:
-                    return {**dict(existing), "status": settled[0], "error": settled[1]}
+            if not opted:
+                if (_anchor_of(existing["job_json"]) is not None
+                        or existing["status"] in _TERMINAL
+                        and _admitted_receipt(execution_id) is not None):
+                    return _refusal(execution_id, _LEGACY_REFUSED)
+                return dict(existing)
+            reason = _existing_refusal(existing, job, receipt)
+            if reason is not None:
+                return _refusal(execution_id, reason)
+            if existing["status"] not in _TERMINAL:
+                _record_admission(execution_id, receipt)
+            settled = _settled_outcome(_anchor_of(job))
+            if settled is not None:
+                return {**dict(existing), "status": settled[0], "error": settled[1]}
             return dict(existing)
-        if opted and refusal is not None:
-            return _refusal(execution_id, refusal)
+        if not opted and _admitted_receipt(execution_id) is not None:
+            return _refusal(execution_id, _LEGACY_REFUSED)
         conn.execute(
             """INSERT OR IGNORE INTO deliveries
                (execution_id, job_json, content, for_failure, status, created_at)
@@ -390,6 +522,8 @@ def enqueue(
         row = conn.execute(
             "SELECT * FROM deliveries WHERE execution_id=?", (execution_id,)
         ).fetchone()
+        if opted:
+            _record_admission(execution_id, receipt)
     return dict(row)
 
 
@@ -414,22 +548,17 @@ def _tombstone_settled(execution_id: str) -> Optional[str]:
     """Upgrade an ``unknown`` tombstone from the durable receipt — never from a job flag.
 
     A redacted/pruned tombstone carries no identity of its own, so the receipt is re-derived
-    from the execution store by exact execution ID.
+    from the execution store by exact execution ID — and only for a tombstone whose queue row
+    this feature admitted, so a legacy tombstone is never adopted on a shared execution ID.
     """
-    from cron.executions import execution_delivery_receipt
-
-    try:
-        receipt = execution_delivery_receipt(execution_id)
-    except (ValueError, TypeError, KeyError):
-        return None
-    status = _ARTIFACT_STATUS.get((receipt or {}).get("state"))
-    if status not in _TERMINAL_SETTLED:
+    settled = _admitted_settled(execution_id)
+    if settled is None or settled[0] not in _TERMINAL_SETTLED:
         return None
     with _transaction() as conn:
         conn.execute(
             "UPDATE delivery_tombstones SET terminal_status=? "
-            "WHERE execution_id=? AND terminal_status='unknown'", (status, execution_id))
-    return status
+            "WHERE execution_id=? AND terminal_status='unknown'", (settled[0], str(execution_id)))
+    return settled[0]
 
 
 def get_status(execution_id: str) -> Optional[dict]:
@@ -438,7 +567,8 @@ def get_status(execution_id: str) -> Optional[dict]:
     if row is not None:
         settled = _row_settled(row)
         if settled is not None:
-            _apply_settled(execution_id, settled, statuses=("pending", "delivering"))
+            _apply_settled(
+                execution_id, settled, statuses=("pending", "delivering", "unknown"))
             row, tombstone = _status_rows(execution_id)
     if row is not None:
         return dict(row)
@@ -527,12 +657,14 @@ def _reconcile_artifact_rows() -> int:
     """Terminalize rows the durable receipt already decided — the receipt-first crash gap.
 
     A sender writes its receipt BEFORE its queue row, so a crash between the two leaves a
-    pending/delivering row whose outcome is already known. Recovering it sends nothing.
+    pending/delivering row whose outcome is already known; a queue timeout fences ``unknown``
+    first, and a receipt that lands after that write failure is still recoverable here. Either
+    way the row is resolved from its own anchor or by exact execution ID, and sends nothing.
     """
     with _transaction() as conn:
         rows = conn.execute(
             "SELECT execution_id, status, job_json FROM deliveries "
-            "WHERE status IN ('pending','delivering')"
+            "WHERE status IN ('pending','delivering','unknown')"
         ).fetchall()
     changed = 0
     for row in rows:
@@ -549,7 +681,8 @@ def reconcile_late_delivery(
     """Narrow late transition: a durable VERIFIED receipt settles its queue row/tombstone.
 
     Receipt-FIRST: this only reads the receipt the late callback already wrote durably.
-    A wrong nonce, a different owning profile, a failed/suppressed receipt or a missing queue
+    A wrong nonce, a different owning profile, a failed/suppressed receipt, a receipt whose
+    queue row was never admitted (a legacy row on the same execution ID) or a missing queue
     row all refuse — a direct-send callback legitimately finds no queue row at all.
     """
     from cron.executions import delivery_profile_sha256, reconcile_delivery_request
@@ -560,6 +693,8 @@ def reconcile_late_delivery(
     except ValueError:
         return False
     if receipt is None or receipt.get("state") != "verified":
+        return False
+    if not _queue_admitted(receipt):
         return False
     if receipt.get("sender_profile_sha256") != delivery_profile_sha256():
         return False
@@ -684,7 +819,7 @@ def _terminalize_wait_timeout(execution_id: str) -> str:
     )
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT status, job_json FROM deliveries WHERE execution_id=?",
+            "SELECT execution_id, status, job_json FROM deliveries WHERE execution_id=?",
             (execution_id,),
         ).fetchone()
         settled = _row_settled(row) if row is not None else None

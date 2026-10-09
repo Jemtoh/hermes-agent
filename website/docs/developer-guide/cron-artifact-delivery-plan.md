@@ -400,10 +400,38 @@ corrections to the phrasing below.
   the NEW `executions.execution_delivery_receipt(execution_id)` because a redacted row or pruned
   tombstone no longer carries the anchor. Only a settled receipt may terminalize a row, so a row
   whose send is genuinely in flight is never touched.
+- **Correction 4 — the refusal must precede EVERY adoption, and a pending row's own payload is
+  validated too.** `enqueue` returns the validated refusal before it reads the tombstone or the
+  existing row, so a changed message/envelope/target/size can no longer ride in on a pending row
+  while only the anchor is compared. An existing pending row is additionally held to its OWN
+  stored payload — envelope, queued content, canonical request (token, purpose, authorized target,
+  ordered kind/hash/transport/size), execution id and job id — compared with the receipt, and a
+  job whose own `id`/`execution_id` disagree with its anchor is refused. The incoming validation
+  is unchanged in strength; it is now enforced on both sides of the comparison.
+- **Correction 5 — admission metadata is REQUIRED, and lives in the existing receipt.**
+  `executions.mark_queue_admitted(execution_id, request_sha256)` writes a single
+  `queue_admitted: true` marker into the receipt JSON the row already has — no new column, table or
+  store, and no token/digest copied into a queue tombstone. It is written only AFTER a validated
+  new queue insert, or for a matching original pending opt-in, by CAS on the exact receipt, so it
+  is durable only once the queue row is. A terminal row, pruned tombstone or redacted (`job_json
+  = '{}'`) row is adopted or reconciled ONLY when the receipt carries that marker, and a
+  `for_failure=True` delivery is the legacy route even when its job dict still carries a stale
+  anchor. Consequences, all enforced in code: `enqueue` refuses opted-in adoption of an unadmitted
+  legacy tombstone or terminal row even when a receipt now exists on that execution ID; a legacy
+  incoming never adopts an admitted slot; and `reconcile_late_delivery` refuses an unadmitted
+  receipt. Redaction is untouched — the marker is one boolean on the execution store's existing
+  receipt, never identity or a digest on the queue side.
+- **Correction 6 — settlement fences the recorded process incarnation, not just the PID.**
+  `settle_delivery_request` already required the claiming PID and owning profile; it now also
+  compares the `sender_started_at` fingerprint recorded at claim time with the live reading for
+  this PID through `gateway.status.start_time_fingerprints_match`. A reused PID whose start time
+  changed cannot settle a `verified` receipt, and a start time that either side cannot read leaves
+  the attempt `sending` — unverifiable is fenced, never assumed equal.
 
 Honest limitations of this implementation: a queue payload that does not carry an anchor (a
-legacy-shaped row) can never be reconciled from the receipt alone — only rows written by this
-feature do; notification proof stays bounded to 64 chunks; the worker's enqueue waits at most
+legacy-shaped row) can never be reconciled from the receipt alone — only rows this feature
+ADMITTED can be, which the receipt's `queue_admitted` marker now enforces rather than assumes;
+notification proof stays bounded to 64 chunks; the worker's enqueue waits at most
 `DEFAULT_DELIVERY_WAIT_TIMEOUT_SECONDS` and a pending row is deferred to the next gateway rather
 than failed; and receipt-bearing rows still retain small identity metadata indefinitely under the
 approved retention contract.
@@ -415,3 +443,29 @@ code and 21 passed after it; the artifact/queue target suites are 132 passed, 0 
 1,803 passed, 0 failed, 12 skipped. `scripts/check` reports 11 checks ok with no new health
 waiver and no hook bypass. No live cache, vault, Notion, broker, provider, model, schedule or
 message was touched.
+
+Bounded acceptance repair (9 October 2026), same isolated-worktree, fakes-only rules: the four
+canonical root probes were 4 failed before and 4 passed after; `tests/cron` is 163 files,
+1,633 passed, 0 failed, 12 skipped; the Telegram receipt/native/chunk/rich/profile callers are
+141 passed, 0 failed; and `scripts/check` again reports 11 checks ok, 0 blocking and 0 advisory
+findings, with no new health waiver and no hook bypass. The four probes are owned regressions in
+`tests/cron/test_artifact_queue_integration.py`, alongside the additional cases for a corrupted
+stored payload, a `for_failure=True` alert carrying a stale anchor, a contended claim, an old
+`failed_certain` pending row after a fresh attempt, and the `failed_certain` no-send proof
+requirement. No commit, merge, push, activation, model change or consumer edit was performed.
+
+
+Admission ordering correction (Codex independent regression): the receipt marker
+commits while the queue's admission transaction still holds its write lock, before
+the row becomes visible. Matching pending retries repair absent provenance before
+returning. A failed marker/readback rolls back admission rather than exposing work.
+A marker without a committed queue row is permission only, never delivery proof.
+
+Adoption independently validates the actual notification against its digest and
+the current resolved authorized destination against the durable identity, even
+for terminal rows. Failure alerts use a copy with artifact authority removed;
+their legacy queue outcomes cannot borrow report receipts or affect the caller.
+
+Sender settlement uses the existing fingerprint comparator with tolerance=0; its
+liveness default tolerates drift and cannot prove the exact sending incarnation.
+An independently reproduced one-unit changed start is refused before verification.

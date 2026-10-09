@@ -736,6 +736,26 @@ def delivery_profile_sha256() -> str:
     return hashlib.sha256(str(get_hermes_home().resolve()).encode()).hexdigest()
 
 
+def _sender_incarnation_matches(receipt) -> bool:
+    """True only when the claimer's PID is still the SAME process incarnation that claimed it.
+
+    A recorded start time is what distinguishes the claimer from a later process that reused its
+    PID. A start time that no longer matches — or that either side cannot read — is not proof of
+    the original sender, so the attempt stays fenced: it never settles on an unverifiable
+    incarnation.
+    """
+    from gateway.status import start_time_fingerprints_match
+
+    recorded = receipt.get('sender_started_at')
+    current = _process_start_time(os.getpid())
+    if recorded is None or current is None:
+        return False
+    try:
+        return start_time_fingerprints_match(recorded, current, tolerance=0)
+    except (TypeError, ValueError):
+        return False
+
+
 def settle_delivery_request(
     execution_id: str, request_sha256: str, *, attempt_nonce: str, state: str,
     evidence: Optional[dict] = None, reason: Optional[str] = None,
@@ -773,6 +793,8 @@ def settle_delivery_request(
         if (receipt.get('sender_pid') != os.getpid()
                 or receipt.get('sender_profile_sha256') != delivery_profile_sha256()
                 or profile_sha256 is not None and receipt.get('sender_profile_sha256') != profile_sha256):
+            return None
+        if not _sender_incarnation_matches(receipt):
             return None
         from cron.artifact_proof import evidence as validate_evidence
 
@@ -869,6 +891,32 @@ def execution_delivery_receipt(execution_id: str) -> Optional[dict]:
     if not row or not row.get('delivery_receipt'):
         return None
     return _decode_receipt(row)
+
+
+def mark_queue_admitted(execution_id: str, request_sha256: str) -> bool:
+    """Record that this exact receipt's queue row was ADMITTED, by CAS on the exact receipt.
+
+    A queue row or tombstone whose payload was later redacted carries no identity of its own, so
+    the only way to tell a row this feature wrote from a LEGACY row that happens to share the
+    execution ID is provenance the receipt itself keeps. The marker is set inside the serialized queue transaction after a validated
+    insert (or a matching pending opt-in), before that transaction commits, so a receipt that was merely prepared can
+    never adopt a legacy terminal row or tombstone. ``False`` means the anchor moved or the marker
+    was already recorded — never a licence to adopt.
+    """
+    from cron.artifact_delivery import _hex
+
+    _hex(request_sha256, 64)
+    with _transaction(immediate=True) as conn:
+        row = _fetch(conn, str(execution_id))
+        if not row or not row.get('delivery_receipt'):
+            return False
+        receipt = _decode_receipt(row)
+        if receipt['request_sha256'] != request_sha256 or receipt.get('queue_admitted') is True:
+            return False
+        receipt['queue_admitted'] = True
+        return conn.execute(
+            'UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
+            (json.dumps(receipt), str(execution_id), row['delivery_receipt'])).rowcount == 1
 
 
 def get_artifact_delivery_receipt(token: str, purpose: str, *, expected_request_sha256=None) -> Optional[dict]:

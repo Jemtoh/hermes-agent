@@ -254,8 +254,13 @@ def claim_next() -> Optional[dict]:
     return result
 
 
-def _finish(execution_id: str, *, error: Optional[str], suppressed: bool = False) -> bool:
+def _finish(
+    execution_id: str, *, error: Optional[str], suppressed: bool = False, unverified: bool = False
+) -> bool:
     status = "failed" if error else "suppressed" if suppressed else "delivered"
+    if unverified and status == "delivered":
+        status = "unknown"
+        error = "Gateway send was unverified; outcome is unknown and was not retried."
     safe_error = (
         redact_sensitive_text(str(error), force=True, redact_url_credentials=True)
         if error
@@ -335,7 +340,8 @@ def drain(
             except BaseException as exc:
                 error = f"{type(exc).__name__}: {exc}"
             _finish(row["execution_id"], error=error,
-                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")))
+                    suppressed=bool(row["job"].get("_notification_all_targets_suppressed")),
+                    unverified=bool(row["job"].get("last_delivery_unverified")))
         finally:
             with _lock:
                 _ACTIVE_DELIVERIES.discard(row["execution_id"])

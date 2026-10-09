@@ -181,6 +181,8 @@ def test_queued_outcome_is_not_the_delivered_outcome():
         kwargs.update(over)
         return _classify_delivery_outcome(**kwargs)
 
+    assert classify(delivery_unverified=["telegram:123"]) == "unverified"
+    assert classify(delivery_queued=True, delivery_unverified=["telegram:123"]) == "queued"
     assert classify(delivery_queued=True) == "queued"
     assert classify() == "delivered"
     assert classify(delivery_error="timeout") == "failed"

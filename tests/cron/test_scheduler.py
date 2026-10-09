@@ -1771,13 +1771,9 @@ class TestParallelTick:
         assert start_s2 >= end_s1, "Jobs ran concurrently despite max_parallel=1"
 
 class TestDeliverResultTimeoutCancelsFuture:
-    """When the live adapter's confirmation outlasts the wait, the outcome depends on whether the
-    send had STARTED on the gateway loop. Started: it is in flight (a paced multi-chunk send can
-    legitimately outlast the wait) — leave it running and skip the standalone fallback, which would
-    duplicate it (#38922). Never started (wedged loop): nothing was sent, so fall through to
-    standalone or the message is silently dropped. ``future.cancel()`` cannot tell the two apart:
-    a run_coroutine_threadsafe future stays PENDING until done, so cancel() returns True mid-send
-    and kills it — these tests drive a real loop for that reason.
+    """A real loop distinguishes unverified in-flight sends from safe never-started fallback.
+    Cancelling a run_coroutine_threadsafe future also kills an in-flight send (#38922),
+    so the fallback must only cancel work that never started.
     """
 
     def _deliver(self, monkeypatch, adapter, loop):
@@ -1795,7 +1791,7 @@ class TestDeliverResultTimeoutCancelsFuture:
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
              patch("tools.send_message_tool._send_to_platform", new=standalone_send):
             result = _deliver_result(job, "Hello world", adapters={Platform.TELEGRAM: adapter}, loop=loop)
-        return result, standalone_send
+        return result, standalone_send, job
 
     def test_in_flight_send_outlasting_the_wait_keeps_running_and_is_not_duplicated(self, monkeypatch):
         import asyncio
@@ -1815,11 +1811,12 @@ class TestDeliverResultTimeoutCancelsFuture:
         adapter = MagicMock()
         adapter.send = slow_send
         try:
-            result, standalone_send = self._deliver(monkeypatch, adapter, loop)
+            result, standalone_send, job = self._deliver(monkeypatch, adapter, loop)
             time.sleep(0.6)
         finally:
             loop.call_soon_threadsafe(loop.stop)
-        assert result is None, f"expected the in-flight send to count as delivered, got {result!r}"
+        assert result is None, f"expected no resend of the in-flight send, got {result!r}"
+        assert job.get("last_delivery_unverified") == ["telegram:123"]
         standalone_send.assert_not_awaited()
         assert events == ["started", "finished"], "the in-flight send must not be cancelled mid-way"
 
@@ -1834,12 +1831,13 @@ class TestDeliverResultTimeoutCancelsFuture:
         adapter = MagicMock()
         adapter.send = AsyncMock(return_value=MagicMock(success=True))
         try:
-            result, standalone_send = self._deliver(monkeypatch, adapter, loop)
+            result, standalone_send, job = self._deliver(monkeypatch, adapter, loop)
             time.sleep(0.8)  # the loop un-wedges: the abandoned send must still never go out
         finally:
             loop.call_soon_threadsafe(loop.stop)
         assert result is None, f"standalone should have delivered, got {result!r}"
         standalone_send.assert_awaited_once()
+        assert not job.get("last_delivery_unverified")
         adapter.send.assert_not_awaited()
 
 class TestDeliverResultPartialSplitDelivery:

@@ -54,6 +54,25 @@ def test_tick_skips_job_when_durable_fire_claim_is_lost(monkeypatch):
     assert calls == []
 
 
+@pytest.mark.parametrize("crashed", [False, True])
+def test_run_records_unverified_delivery_in_execution_ledger(monkeypatch, crashed):
+    _patch_pipeline(monkeypatch)
+    finished = []
+    monkeypatch.setattr(s, "create_execution", lambda *_a, **_k: {"id": "exec-unverified"})
+    monkeypatch.setattr(s, "claim_dispatch", lambda _id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _id: {})
+    monkeypatch.setattr(s, "finish_execution", lambda *a, **k: finished.append(k))
+    if crashed:
+        def refuse(*_a, **_k):
+            raise RuntimeError("fake worker refused")
+        monkeypatch.setattr(s, "run_job", refuse)
+    def accepted_without_ack(job, *_a, **_k):
+        job["last_delivery_unverified"] = ["telegram:123"]
+    monkeypatch.setattr(s, "_deliver_result", accepted_without_ack)
+    s.run_one_job({"id": "unverified", "name": "fake report", "deliver": "telegram:123"})
+    assert finished[-1]["delivery_outcome"] == "unverified"
+
+
 def test_run_one_job_success_sequence(monkeypatch):
     """The extracted helper runs the same execute→save→deliver→mark sequence
     for a successful job."""

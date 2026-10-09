@@ -234,3 +234,23 @@ def test_same_gateway_recovers_terminalization_failure_without_resending(
     status = queue.get_status("exec-4")
     assert status["status"] == "unknown"
     assert "not retried" in status["error"]
+
+
+def test_unverified_send_is_fenced_without_replay(tmp_path, monkeypatch):
+    import cron.delivery_queue as queue
+
+    monkeypatch.setattr(queue, "DELIVERY_DB", tmp_path / "deliveries.db")
+    queue.enqueue("exec-unverified", {"id": "job-1"}, "brief")
+
+    def send(job, content, for_failure):
+        job["last_delivery_unverified"] = ["telegram:123"]
+        return None
+
+    assert queue.drain(send) == 1
+    status = queue.get_status("exec-unverified")
+    assert status["status"] == "unknown"
+    assert "unverified" in status["error"]
+    assert status["content"] == ""
+    assert status["job_json"] == "{}"
+    assert queue.enqueue_and_wait("exec-unverified", {"id": "job-1"}, "brief", timeout=0)
+    assert queue.drain(send) == 0

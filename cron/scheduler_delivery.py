@@ -1508,9 +1508,8 @@ def _live_send_text(
     try:
         send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_SECS)
     except TimeoutError:
-        # Slow confirmation != failure. Never started (loop wedged): nothing was sent, so fall through
-        # to standalone or it is silently dropped. Started: in flight (a paced multi-chunk send can
-        # legitimately outlast the wait) — leave it running; a standalone resend would DUPLICATE.
+        # Never started: fallback is safe. In flight: leave it running with an uncertain outcome;
+        # a paced multi-chunk send can outlast the wait, and a standalone resend would duplicate it.
         with dispatch_lock:
             dispatch["abandoned"] = not dispatch["started"]
         if dispatch["abandoned"]:
@@ -1522,9 +1521,10 @@ def _live_send_text(
         logger.warning(
             "Job '%s': live adapter send to %s:%s timed out "
             "after 60s; already dispatched (in flight), "
-            "assuming delivered (skipping standalone fallback "
+            "delivery unverified (skipping standalone fallback "
             "to avoid duplicate)",
             job["id"], t.platform_name, t.chat_id)
+        unverified_targets.append(t.where)
         return True, True, None
     except PartialDeliveryError as ex:
         # The head of a split send is already on screen: a standalone resend would duplicate it.

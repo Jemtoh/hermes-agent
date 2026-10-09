@@ -525,6 +525,10 @@ def _normalize_job_record(job: dict[str, Any]) -> dict[str, Any]:
     # Derived from the scheduler-honoured ``enabled`` flag so a half-paused record cannot render
     # "paused" while still firing. See effective_job_state().
     normalized["state"] = effective_job_state(normalized)
+    # Read-only running display uses the same fresh/dead-owner claim rule as dispatch.
+    if normalized["state"] == "scheduled" and _claim_is_live(
+            normalized.get("run_claim"), _hermes_now(), _oneshot_run_claim_ttl_seconds()):
+        normalized["state"] = "running"
     return normalized
 
 

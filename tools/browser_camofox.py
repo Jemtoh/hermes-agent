@@ -285,7 +285,8 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> dict[str, A
     """Ensure a tab exists for the session, creating one if needed."""
     session = _get_session(task_id)
     if not session["tab_id"]:
-        data = _post("/tabs", {"userId": session["user_id"], "listItemId": session["session_key"], "url": url})
+        data = _post("/tabs", {"userId": session["user_id"], "listItemId": session["session_key"], "url": url},
+                     timeout=_page_load_timeout() if url and url != "about:blank" else None)
         session["tab_id"] = data.get("tabId")
     return session
 
@@ -309,6 +310,11 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
 
 
 # ---- HTTP helpers ----
+def _page_load_timeout() -> int:
+    """Calls that can navigate get at least 60s, or the configured command budget."""
+    return max(60, _get_command_timeout())
+
+
 def _request(method: str, path: str, timeout: Optional[int] = None, **kwargs: Any) -> requests.Response:
     """Issue an authenticated request to camofox and return the raised-for-status response."""
     resp = getattr(requests, method)(f"{get_camofox_url()}{path}", headers=_auth_headers(),
@@ -384,7 +390,7 @@ def _navigate_tab(task_id: Optional[str], browser_url: str) -> tuple[dict[str, A
     session = _get_session(task_id)
     if session["tab_id"]:
         try:
-            data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=60)
+            data = _post(_tab_path(session, "navigate"), {"userId": session["user_id"], "url": browser_url}, timeout=_page_load_timeout())
             return session, data
         except requests.HTTPError as e:
             if e.response is None or e.response.status_code != 404:
@@ -466,10 +472,11 @@ def _with_tab(task_id: Optional[str], guard_action: Optional[str], body: Callabl
 
 
 def _tab_action(task_id: Optional[str], guard_action: Optional[str], suffix: str,
-                body: dict[str, Any], result: Callable[[dict], dict]) -> str:
+                body: dict[str, Any], result: Callable[[dict], dict],
+                timeout: Optional[int] = None) -> str:
     """Simple tab action: POST ``body`` to ``/tabs/<id>/<suffix>``, build the result."""
     return _with_tab(task_id, guard_action, lambda session: json.dumps(
-        result(_post(_tab_path(session, suffix), {"userId": session["user_id"], **body}))))
+        result(_post(_tab_path(session, suffix), {"userId": session["user_id"], **body}, timeout=timeout))))
 
 
 def camofox_snapshot(full: bool = False, task_id: Optional[str] = None, user_task: Optional[str] = None) -> str:
@@ -485,7 +492,8 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
     """Click an element by ref via Camofox."""
     clean_ref = ref.lstrip("@")  # our tool convention prefixes refs with @
     return _tab_action(task_id, "click", "click", {"ref": clean_ref},
-                       lambda data: {"success": True, "clicked": clean_ref, "url": data.get("url", "")})
+                       lambda data: {"success": True, "clicked": clean_ref, "url": data.get("url", "")},
+                       timeout=_page_load_timeout())
 
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
@@ -521,7 +529,8 @@ def camofox_back(task_id: Optional[str] = None) -> str:
 
 def camofox_press(key: str, task_id: Optional[str] = None) -> str:
     """Press a keyboard key via Camofox."""
-    return _tab_action(task_id, "press", "press", {"key": key}, lambda data: {"success": True, "pressed": key})
+    return _tab_action(task_id, "press", "press", {"key": key}, lambda data: {"success": True, "pressed": key},
+                       timeout=_page_load_timeout())
 
 
 def camofox_close(task_id: Optional[str] = None) -> str:

@@ -770,10 +770,11 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         _maybe_start_recording(nav_session_key)
 
     result = _session._run_browser_command(nav_session_key, "open", [url],
-                                  timeout=_get_open_command_timeout(first_open=is_first_nav))
+                                  timeout=_get_open_command_timeout(first_open=not session_info.get("_daemon_warm", False)))
     if not result.get("success"):
         return _dumps(_err(result.get("error", "Navigation failed")))
 
+    session_info["_daemon_warm"] = True
     data = result.get("data", {})
     title = data.get("title", "")
     final_url = data.get("url", url)

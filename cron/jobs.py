@@ -2,8 +2,9 @@
 """Cron job storage: ~/.hermes/cron/jobs.json; output in
 ~/.hermes/cron/output/{job_id}/{timestamp}.md"""
 
-from cron.job_fields import _normalize_job_optional_text, _normalize_reasoning_effort
+from cron.job_fields import _normalize_job_optional_text, _normalize_reasoning_effort, validate_job_modes
 from cron.consumer_run_lock import release_unstarted_fire
+from cron.artifact_delivery import normalize_script_output_format
 
 import contextlib
 import copy
@@ -1740,6 +1741,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "failure_deliver": _normalize_failure_deliver,
     "interpreter": _normalize_job_optional_text,
     "run_lock": _normalize_job_optional_text,
+    "script_output_format": normalize_script_output_format,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1750,28 +1752,9 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
     "run_lock": _normalize_job_optional_text,
+    "script_output_format": normalize_script_output_format,
 }
 
-
-def _validate_job_mode_invariants(
-    monitor_script: Optional[str],
-    monitor_url: Optional[str],
-    no_agent: bool,
-    script: Optional[str],
-) -> None:
-    """Execution-mode invariants shared by create_job and update_job (no bypass via the update
-    door)."""
-    if monitor_script and monitor_url:
-        raise ValueError(
-            "monitor_script and monitor_url are mutually exclusive — a job "
-            "can only have one monitor source.")
-    if (monitor_script or monitor_url) and no_agent:
-        raise ValueError(
-            "monitor_script/monitor_url cannot be combined with no_agent=True — "
-            "the whole point of a monitor job is to suppress or wake the AGENT "
-            "based on source changes. Use a plain no_agent script job instead.")
-    if no_agent and not script:
-        raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)
 
 
 def _oneshot_past_grace_error(run_at: Any) -> ValueError:
@@ -1822,6 +1805,7 @@ def create_job(
     pinned: bool = False,
     interpreter: Optional[str] = None,
     run_lock: Optional[str] = None,
+    script_output_format: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1859,7 +1843,7 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
-    _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
+    validate_job_modes(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"], f["script_output_format"])
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
         raise ValueError(EMPTY_PAYLOAD_ERROR)
@@ -1922,7 +1906,7 @@ def create_job(
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
-        ("run_lock", f["run_lock"]),
+        ("run_lock", f["run_lock"]), ("script_output_format", f["script_output_format"]),
     ):
         if value is not None:
             job[key] = value
@@ -2111,12 +2095,13 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
-        if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
-            _validate_job_mode_invariants(
+        if {"monitor_script", "monitor_url", "no_agent", "script", "script_output_format"}.intersection(updates):
+            validate_job_modes(
                 updated.get("monitor_script") or None,
                 updated.get("monitor_url") or None,
                 bool(updated.get("no_agent")),
-                _normalize_job_optional_text(updated.get("script")))
+                _normalize_job_optional_text(updated.get("script")),
+                updated.get("script_output_format"))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
         if "schedule" in updates:

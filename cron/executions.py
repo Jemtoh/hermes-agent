@@ -8,6 +8,8 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 from __future__ import annotations
 
 import logging
+import json
+import hashlib
 import math
 import os
 import sqlite3
@@ -89,6 +91,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    add_column_if_missing(conn, "executions", "delivery_receipt", "delivery_receipt TEXT")
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_request_key "
+                     "ON executions(json_extract(delivery_receipt, '$.request_key')) "
+                     "WHERE delivery_receipt IS NOT NULL "
+                     "AND json_extract(delivery_receipt, '$.state') != 'failed_certain'")
+    except sqlite3.OperationalError:
+        logger.warning("Artifact delivery JSON index unavailable; opt-in sends are fenced")
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
@@ -99,10 +109,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
+    with _lock, transaction(_connect(), immediate=immediate) as conn:
         yield conn
 
 
@@ -202,7 +212,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','unknown') AND delivery_receipt IS NULL
              ORDER BY julianday(finished_at) DESC, finished_at DESC,
                       julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
@@ -560,3 +570,153 @@ def latest_executions(job_ids: list[str]) -> dict[str, dict[str, Any]]:
             clean,
         ).fetchall()
     return {row["job_id"]: dict(row) for row in rows}
+
+
+def _delivery_identity(request: dict) -> tuple[str, str]:
+    from cron.artifact_delivery import _hex, _keys
+
+    _keys(request, ('token', 'purpose', 'target', 'message_sha256', 'artifacts'))
+    _hex(request['token'], 32)
+    _hex(request['message_sha256'], 64)
+    if request['purpose'] not in ('report', 'review'):
+        raise ValueError('invalid artifact purpose')
+    target = request['target']
+    _keys(target, ('platform', 'chat_id', 'thread_id'))
+    if target['platform'] != 'telegram' or not isinstance(target['chat_id'], str) or not target['chat_id']:
+        raise ValueError('artifact delivery requires a Telegram target')
+    if target['thread_id'] is not None and not isinstance(target['thread_id'], str):
+        raise ValueError('invalid artifact thread')
+    if not isinstance(request['artifacts'], list) or not request['artifacts']:
+        raise ValueError('artifact identity requires evidence')
+    kinds = set()
+    for artifact in request['artifacts']:
+        _keys(artifact, ('kind', 'sha256', 'transport', 'size'))
+        kind = artifact['kind']
+        allowed = ('report',) if request['purpose'] == 'report' else ('review', 'review_result')
+        if not isinstance(kind, str) or kind not in allowed or kind in kinds:
+            raise ValueError('invalid or duplicate artifact identity')
+        kinds.add(kind)
+        _hex(artifact['sha256'], 64)
+        if artifact['transport'] not in ('text', 'document'):
+            raise ValueError('invalid artifact transport')
+        if type(artifact['size']) is not int or artifact['size'] < 0:
+            raise ValueError('invalid artifact size')
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return request['purpose'] + ':' + request['token'], digest
+
+
+def _receipt_records(conn, key):
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_delivery_request_key'").fetchone():
+        raise ValueError('artifact delivery requires SQLite JSON index support')
+    return conn.execute(
+        "SELECT * FROM executions WHERE json_extract(delivery_receipt, '$.request_key')=? "
+        "ORDER BY claimed_at DESC, id DESC", (key,)).fetchall()
+
+
+def _decode_receipt(row):
+    receipt = json.loads(row['delivery_receipt'])
+    if not isinstance(receipt, dict) or not isinstance(receipt.get('request'), dict):
+        raise ValueError('corrupt artifact receipt anchor')
+    key, digest = _delivery_identity(receipt['request'])
+    if (type(receipt.get('version')) is not int or receipt.get('version') != 1
+            or receipt.get('execution_id') != row['id']
+            or receipt.get('request_key') != key or receipt.get('request_sha256') != digest
+            or receipt.get('state') not in ('unsent', 'sending', 'verified', 'failed_certain', 'unknown', 'suppressed')):
+        raise ValueError('corrupt artifact receipt anchor')
+    return receipt
+
+
+def _delivery_owner_is_dead(row) -> bool:
+    from gateway.status import _pid_exists
+
+    try:
+        if not _pid_exists(row['pid']):
+            return True
+        if row['process_started_at'] is None:
+            return False
+        return not _owner_is_live(row['pid'], row['process_started_at'])
+    except Exception:
+        logger.warning('Artifact owner liveness is unverifiable; keeping fence', exc_info=True)
+        return False
+
+
+def prepare_delivery_request(execution_id: str, job_id: str, request: dict) -> dict:
+    """Bind an owned execution to immutable ID/hash metadata before any dispatch."""
+    key, digest = _delivery_identity(request)
+    with _transaction(immediate=True) as conn:
+        owner = _fetch(conn, execution_id)
+        if (not owner or owner['job_id'] != job_id or owner['process_id'] != _PROCESS_ID
+                or owner['pid'] != os.getpid() or owner['status'] not in ('claimed', 'running')):
+            raise ValueError('artifact request execution is not owned and active')
+        active = None
+        for row in _receipt_records(conn, key):
+            receipt = _decode_receipt(row)
+            if receipt['request_sha256'] != digest:
+                raise ValueError('artifact request identity conflict')
+            if (receipt['state'] == 'unsent' and not receipt.get('attempt_nonce')
+                    and not receipt.get('evidence')
+                    and _delivery_owner_is_dead(row)):
+                receipt.update(state='failed_certain', reason='owner exited before dispatch')
+                conn.execute('UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
+                             (json.dumps(receipt), row['id'], row['delivery_receipt']))
+            elif receipt['state'] != 'failed_certain':
+                if active is not None:
+                    raise ValueError('duplicate active artifact request')
+                active = receipt
+        if active is not None:
+            return active
+        if owner.get('delivery_receipt') is not None:
+            raise ValueError('execution already has an artifact request')
+        receipt = {'version': 1, 'execution_id': execution_id, 'request_key': key,
+                   'request_sha256': digest, 'request': request, 'state': 'unsent'}
+        changed = conn.execute(
+            "UPDATE executions SET delivery_receipt=? WHERE id=? AND job_id=? "
+            "AND process_id=? AND pid=? AND status IN ('claimed','running') AND delivery_receipt IS NULL",
+            (json.dumps(receipt), execution_id, job_id, _PROCESS_ID, os.getpid())).rowcount
+        if changed != 1:
+            raise ValueError('artifact request ownership changed')
+        return receipt
+
+
+def claim_delivery_request(execution_id: str, request_sha256: str) -> Optional[dict]:
+    """Exactly one sender wins; queued workers retain their original execution anchor."""
+    with _transaction(immediate=True) as conn:
+        row = _fetch(conn, execution_id)
+        if not row or not row.get('delivery_receipt'):
+            raise ValueError('artifact request anchor is missing')
+        receipt = _decode_receipt(row)
+        if receipt['request_sha256'] != request_sha256:
+            raise ValueError('artifact request digest conflict')
+        if receipt['state'] != 'unsent':
+            return None
+        receipt.update(state='sending', attempt_nonce=uuid.uuid4().hex, sender_pid=os.getpid(),
+                       sender_started_at=_process_start_time(os.getpid()),
+                       sender_profile_sha256=hashlib.sha256(str(get_hermes_home().resolve()).encode()).hexdigest())
+        changed = conn.execute('UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
+                               (json.dumps(receipt), execution_id, row['delivery_receipt'])).rowcount
+        if changed != 1:
+            return None
+        return receipt
+
+
+def get_artifact_delivery_receipt(token: str, purpose: str, *, expected_request_sha256=None) -> Optional[dict]:
+    from cron.artifact_delivery import _hex
+
+    _hex(token, 32)
+    if purpose not in ('report', 'review'):
+        raise ValueError('invalid artifact purpose')
+    if expected_request_sha256 is not None:
+        _hex(expected_request_sha256, 64)
+    with _transaction() as conn:
+        receipts = [_decode_receipt(row) for row in _receipt_records(conn, purpose + ':' + token)]
+    if not receipts:
+        return None
+    if len({receipt['request_sha256'] for receipt in receipts}) != 1:
+        raise ValueError('conflicting artifact receipt identities')
+    active = [receipt for receipt in receipts if receipt['state'] != 'failed_certain']
+    if len(active) > 1:
+        raise ValueError('duplicate active artifact receipts')
+    receipt = active[0] if active else receipts[0]
+    if expected_request_sha256 is not None and receipt['request_sha256'] != expected_request_sha256:
+        raise ValueError('artifact receipt request digest conflict')
+    return receipt

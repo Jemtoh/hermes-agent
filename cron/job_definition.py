@@ -15,7 +15,7 @@ JOB_DEFINITION_FIELDS = frozenset({
     "script", "no_agent", "monitor_script", "monitor_url", "context_from",
     "schedule", "schedule_display", "deliver", "origin", "enabled_toolsets",
     "workdir", "attach_to_session", "reasoning_effort", "failure_deliver",
-    "run_lock",
+    "run_lock", "script_output_format",
 })
 
 
@@ -26,6 +26,10 @@ def merge_job_definition(local: dict[str, Any], authored: dict[str, Any]) -> dic
     past one-shot for a live job)."""
     merged = {key: value for key, value in local.items() if key not in JOB_DEFINITION_FIELDS}
     merged.update((key, authored[key]) for key in JOB_DEFINITION_FIELDS if key in authored)
+    if merged.get("script_output_format"):
+        from cron.artifact_delivery import validate_job_format
+        validate_job_format(merged['script_output_format'], no_agent=merged.get('no_agent'),
+                            script=merged.get('script'))
     merged["repeat"] = {
         "completed": (local.get("repeat") or {}).get("completed", 0),
         "times": (authored.get("repeat") or {}).get("times"),

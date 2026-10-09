@@ -29,3 +29,29 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     if text in {"false", "disabled"}:
         return "none"
     return text
+
+
+def validate_job_modes(
+    monitor_script: Optional[str],
+    monitor_url: Optional[str],
+    no_agent: bool,
+    script: Optional[str],
+    script_output_format: Optional[str] = None,
+) -> None:
+    """Execution-mode invariants shared by create_job and update_job (no bypass via the update
+    door)."""
+    from cron.artifact_delivery import validate_job_format
+    from cron.jobs import NO_AGENT_WITHOUT_SCRIPT_ERROR
+
+    validate_job_format(script_output_format, no_agent=no_agent, script=script)
+    if monitor_script and monitor_url:
+        raise ValueError(
+            "monitor_script and monitor_url are mutually exclusive — a job "
+            "can only have one monitor source.")
+    if (monitor_script or monitor_url) and no_agent:
+        raise ValueError(
+            "monitor_script/monitor_url cannot be combined with no_agent=True — "
+            "the whole point of a monitor job is to suppress or wake the AGENT "
+            "based on source changes. Use a plain no_agent script job instead.")
+    if no_agent and not script:
+        raise ValueError(NO_AGENT_WITHOUT_SCRIPT_ERROR)

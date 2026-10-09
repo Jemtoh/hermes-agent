@@ -1518,11 +1518,10 @@ def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
 def _run_no_agent_job(
     job: dict, job_id: str, job_name: str, cancel_event,
 ) -> tuple[bool, str, str, Optional[str]]:
-    """no_agent short-circuit — the script IS the job (no AIAgent, no tokens). stdout → delivered
-    verbatim; empty stdout or wakeAgent=false → silent success; non-zero exit/timeout → error alert.
+    """Run only the script: legacy stdout is verbatim; delivery-v1 validates saved artifacts.
+    Empty/wakeAgent=false is silent; script failures produce the existing error alert.
     """
-    # Load .env first so auto-delivery can resolve *_HOME_CHANNEL: the agent path's per-run dotenv
-    # reload never runs for no_agent jobs. Does not override existing values.
+    # No-agent jobs need their own dotenv load for *_HOME_CHANNEL routing.
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -1531,7 +1530,7 @@ def _run_no_agent_job(
         logger.debug("Job '%s': no_agent .env reload failed", job_id, exc_info=True)
 
     script_path = job.get("script")
-    # Legacy/hand-edited no_agent job without a script: pause it, or it re-fires every tick.
+    # Pause malformed jobs so they cannot refire every tick.
     if not str(script_path or "").strip():
         from cron.jobs import NO_AGENT_WITHOUT_SCRIPT_ERROR
 
@@ -1550,7 +1549,6 @@ def _run_no_agent_job(
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
 
     if not ok:
-        # Deliver the error: a silently broken watchdog is the worst-case outcome.
         alert = (
             f"⚠ Cron watchdog '{job_name}' script failed\n\n"
             f"{output}\n\n"
@@ -1558,7 +1556,10 @@ def _run_no_agent_job(
         )
         return False, f"{header}**Status:** script failed\n\n{output}\n", alert, output
 
-    # wakeAgent=false is a silent signal, same as empty stdout.
+    if job.get("script_output_format"):
+        from cron.artifact_delivery import no_agent_result
+        return no_agent_result(job, output, header)
+
     if not _parse_wake_gate(output):
         logger.info("Job '%s' (no_agent): wakeAgent=false gate — silent run", job_id)
         return True, f"{header}**Status:** silent (wakeAgent=false)\n", SILENT_MARKER, None

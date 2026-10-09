@@ -1977,6 +1977,8 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    if job.get("_artifact_delivery") and not for_failure:
+        return "Artifact delivery transport is not activated"
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
@@ -1984,8 +1986,7 @@ def _deliver_result(
         _record_delivery_verification(job, [])
         return _unresolved_delivery_outcome(job, for_failure)
 
-    # Restart-safe workers have no live gateway adapters: hand the send back through a durable
-    # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
+    # Restart-safe workers queue delivery to the live gateway. The execution
     # id is the idempotency key (the queue never retries an uncertain claimed send). Match on THIS
     # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
     # and that nested delivery must not be keyed under the outer execution id.
@@ -2008,13 +2009,12 @@ def _deliver_result(
 
     from gateway.config import load_gateway_config
 
-    # Wrap with header/footer unless cron.wrap_response: false.
     wrap_response = True
     user_cfg = None
     with contextlib.suppress(Exception):
         user_cfg = _sched.load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    # Mark live sends FINAL so the platform pushes them (Telegram "important" mode mutes otherwise).
+    # FINAL pushes Telegram important-mode notifications.
     notify_delivery = _cron_delivery_notify_enabled(user_cfg)
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.

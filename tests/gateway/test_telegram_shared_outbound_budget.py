@@ -7,6 +7,7 @@ skipped (the next edit shows the same text anyway), and the FINAL edit is never 
 answer is always delivered).
 """
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -19,6 +20,9 @@ def _adapter(send_message: AsyncMock) -> TelegramAdapter:
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     adapter._rich_send_disabled = True
     adapter._bot = MagicMock()
+    # Telegram's real acceptance: a numeric message id per sent message. The strict receipt
+    # contract refuses a send with no provider message id, so the fake must supply one.
+    send_message.return_value = SimpleNamespace(message_id=901, message_thread_id=None)
     adapter._bot.send_message = send_message
     adapter._bot.edit_message_text = AsyncMock(return_value=MagicMock())
     return adapter

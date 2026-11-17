@@ -514,3 +514,13 @@ def test_history_orders_by_instant_across_dst_fall_back(monkeypatch, tmp_path):
     ]
     page = executions.list_executions(job_id="dst-job", before_claimed_at=later["claimed_at"])
     assert [r["id"] for r in page] == [earlier["id"]]
+
+
+def test_unverified_outcome_is_durable_in_the_real_ledger(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    claimed = executions.create_execution("job-unverified", source="builtin")
+    executions.mark_execution_running(claimed["id"])
+    executions.finish_execution(claimed["id"], success=True, delivery_outcome="unverified")
+    persisted = executions.get_execution(claimed["id"])
+    assert persisted["status"] == "completed"
+    assert persisted["delivery_outcome"] == "unverified"

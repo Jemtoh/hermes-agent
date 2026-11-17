@@ -1312,9 +1312,8 @@ def _live_send_text(
     try:
         send_result = future.result(timeout=_LIVE_SEND_CONFIRM_TIMEOUT_SECS)
     except TimeoutError:
-        # Slow confirmation != failure. Never started (loop wedged): nothing was sent, so fall through
-        # to standalone or it is silently dropped. Started: in flight (a paced multi-chunk send can
-        # legitimately outlast the wait) — leave it running; a standalone resend would DUPLICATE.
+        # Never started: fallback is safe. In flight: leave it running with an uncertain outcome;
+        # a paced multi-chunk send can outlast the wait, and a standalone resend would duplicate it.
         with dispatch_lock:
             dispatch["abandoned"] = not dispatch["started"]
         if dispatch["abandoned"]:
@@ -1326,9 +1325,10 @@ def _live_send_text(
         logger.warning(
             "Job '%s': live adapter send to %s:%s timed out "
             "after 60s; already dispatched (in flight), "
-            "assuming delivered (skipping standalone fallback "
+            "delivery unverified (skipping standalone fallback "
             "to avoid duplicate)",
             job["id"], t.platform_name, t.chat_id)
+        unverified_targets.append(t.where)
         return True, True, None
     except PartialDeliveryError as ex:
         # The head of a split send is already on screen: a standalone resend would duplicate it.
@@ -1582,35 +1582,6 @@ def _standalone_send(
         return _failed(e)
 
 
-def _queue_for_live_reconnect(t: _TargetDelivery, content: str, media_files: list, delivery_errors: list) -> None:
-    """Hand a payload the live lane rejected as reconnect-only (``send_path_degraded``) and the
-    standalone lane then failed to send to the delivery ledger, as a failed reconnect-only row
-    owned by the adapter that rejected it: the post-reconnect sweep redelivers it (#125363). Only
-    reached after standalone failed, so nothing was sent and a replay cannot duplicate. The ledger
-    carries text only; dropped attachments are reported."""
-    try:
-        from gateway.delivery_ledger import (
-            compute_obligation_id, is_reconnect_only, ledger_enabled, mark_failed, record_obligation)
-        if not is_reconnect_only(t.live_error) or not ledger_enabled():
-            return
-        session_key = f"cron:{t.platform_name}:{t.chat_id}" + (f":{t.thread_id}" if t.thread_id else "")
-        obligation_id = compute_obligation_id(session_key, f"job:{t.job.get('id', '?')}", content)
-        record_obligation(
-            obligation_id=obligation_id, session_key=session_key, platform=t.platform_name,
-            chat_id=str(t.chat_id), thread_id=t.thread_id, content=content,
-            adapter_profile=getattr(getattr(t.transport, "adapter", None), "_owner_profile", None))
-        mark_failed(obligation_id, str(t.live_error))
-    except Exception:
-        logger.warning("Job '%s': could not queue %s for post-reconnect redelivery",
-                       t.job.get("id"), t.where, exc_info=True)
-        return
-    note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
-    if media_files:
-        note += f" ({len(media_files)} attachment(s) not queued)"
-    logger.warning("Job '%s': %s", t.job.get("id"), note)
-    delivery_errors.append(note)
-
-
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
 ) -> None:
@@ -1632,7 +1603,7 @@ def _deliver_standalone(
         delivery_errors.extend(target_errors)
         # A satellite profile's worker has no platform token, so standalone cannot stand in for a
         # live adapter that is only waiting to reconnect: keep the payload for that adapter.
-        _queue_for_live_reconnect(t, content, media_files, delivery_errors)
+        _reconnect.queue_for_live_reconnect(t, content, media_files, delivery_errors)
         return
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
@@ -1777,6 +1748,25 @@ def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
     return msg
 
 
+def _wrapped_delivery_content(job: dict, content: str, wrap_response: bool) -> str:
+    """The delivered text: the job's own output, or the marked-up cronjob envelope.
+
+    Split out of ``_deliver_result`` to keep that function inside the code-health complexity cap;
+    the envelope wording is the operator-visible contract and must not drift.
+    """
+    if not wrap_response:
+        return content
+    task_name = job.get("name", job["id"])
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job.get('id', '')})\n"
+        f"-------------\n\n"
+        f"{content}\n\n"
+        "To stop or manage this job, send me a new message "
+        f"(e.g. \"stop reminder {task_name}\")."
+    )
+
+
 def _deliver_result(
     job: dict, content: str, adapters=None, loop=None, *, for_failure: bool = False
 ) -> Optional[str]:
@@ -1784,6 +1774,10 @@ def _deliver_result(
     running) the live adapter is tried first (E2EE rooms can't use the standalone HTTP path), then
     standalone fallback. ``for_failure=True`` routes failure-category notices through the job's
     ``failure_deliver`` override when present (NS-788). Returns None on success, else an error."""
+    if job.get("_artifact_delivery") and not for_failure:
+        from cron.artifact_transport import dispatch_artifact
+
+        return dispatch_artifact(job, content, adapters=adapters, loop=loop)
     job.pop("_bot_chat_delivery_receipts", None)
     job.pop("_notification_all_targets_suppressed", None)
     targets = _resolve_delivery_targets(job, for_failure=for_failure)
@@ -1791,53 +1785,31 @@ def _deliver_result(
         _record_delivery_verification(job, [])
         return _unresolved_delivery_outcome(job, for_failure)
 
-    # Restart-safe workers have no live gateway adapters: hand the send back through a durable
-    # queue so the current or replacement gateway performs it with relay/E2EE parity. The execution
+    # Restart-safe workers queue delivery to the live gateway. The execution
     # id is the idempotency key (the queue never retries an uncertain claimed send). Match on THIS
     # job's own attempt: a worker's script may dispatch another job in-process (`hermes cron run`),
     # and that nested delivery must not be keyed under the outer execution id.
-    external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER", "")
-    if (external_execution and adapters is None
-            and external_execution == str(job.get("execution_id") or "")
-            and any(target["platform"] not in (BOT_CHAT_PLATFORM, ROOM_PLATFORM) for target in targets)):
-        from cron.delivery_queue import enqueue_and_wait
+    from cron.delivery_queue import maybe_enqueue_for_live_gateway
 
-        _record_delivery_verification(job, [])
-        error = enqueue_and_wait(external_execution, job, content, for_failure=for_failure)
-        from cron.delivery_queue import get_status
-        delivery_status = get_status(external_execution)
-        if delivery_status and delivery_status["status"] == "suppressed":
-            job["_notification_all_targets_suppressed"] = True
-        from cron.jobs import get_job
-        refreshed = get_job(job["id"]) or {}
-        job["last_delivery_queued"] = refreshed.get("last_delivery_queued")
+    handled, error = maybe_enqueue_for_live_gateway(
+        job, content, targets, adapters=adapters, for_failure=for_failure,
+        record_verification=_record_delivery_verification)
+    if handled:
         return error
 
     from gateway.config import load_gateway_config
 
-    # Wrap with header/footer unless cron.wrap_response: false.
     wrap_response = True
     user_cfg = None
     with contextlib.suppress(Exception):
         user_cfg = _sched.load_config()
         wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    # Mark live sends FINAL so the platform pushes them (Telegram "important" mode mutes otherwise).
+    # FINAL pushes Telegram important-mode notifications.
     notify_delivery = _cron_delivery_notify_enabled(user_cfg)
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job.get('id', '')})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            "To stop or manage this job, send me a new message "
-            f"(e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
+    delivery_content = _wrapped_delivery_content(job, content, wrap_response)
 
     from gateway.platforms.base import BasePlatformAdapter
     # Bridge media-policy config into the env vars the path validator reads. The gateway does this
@@ -1949,5 +1921,6 @@ from cron import scheduler as _sched
 from cron.scheduler_delivery_room import (
     ROOM_PLATFORM, deliver_to_room, parse_room_deliver_token, resolve_room_target)
 from cron import scheduler_delivery_origin as _origin
+from cron import scheduler_delivery_reconnect as _reconnect
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script

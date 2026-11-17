@@ -397,11 +397,16 @@ async def _check_error_registration(monkeypatch, adapter, app):
 async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered):
     scheduled, effects = [], []
     create = app._Application__create_task
+    released = asyncio.Event()
 
     def cancel_on_schedule(coroutine, *args, **kwargs):
         task = create(coroutine, *args, **kwargs)
         if kwargs.get("is_error_handler"):
             scheduled.append((task, coroutine))
+            # Registered AFTER create() returned, so the owner's own release callback (added inside
+            # it) runs first. Python 3.14 can complete gather() for already-done tasks before their
+            # queued done callbacks run, so stop() returning is not evidence the claim was released.
+            task.add_done_callback(lambda _done: released.set())
             task.cancel()
         return task
 
@@ -417,6 +422,7 @@ async def _check_error_cancel_before_entry(monkeypatch, adapter, app, delivered)
         await app.process_update(update(app.bot))
         await app.stop()
     assert len(scheduled) == 1 and not effects
+    await asyncio.wait_for(released.wait(), 2)
     assert not adapter._inflight_update_ids and not adapter._seen_update_ids
     # The cancelled PTB task never awaited the callback coroutine: it must be closed too.
     try:

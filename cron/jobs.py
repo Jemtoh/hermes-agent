@@ -2,6 +2,10 @@
 """Cron job storage: ~/.hermes/cron/jobs.json; output in
 ~/.hermes/cron/output/{job_id}/{timestamp}.md"""
 
+from cron.job_fields import _normalize_job_optional_text, _normalize_reasoning_effort, validate_job_modes
+from cron.consumer_run_lock import release_unstarted_fire
+from cron.artifact_delivery import normalize_script_output_format
+
 import contextlib
 import copy
 from contextvars import ContextVar
@@ -34,7 +38,7 @@ from agent.deadline import poll_until
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
-from cron.jobs_invariants import _validate_job_mode_invariants, validate_schedule_knobs
+from cron.jobs_invariants import validate_schedule_knobs
 from cron.jobs_model_pin import _main_model_pin
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
@@ -525,6 +529,10 @@ def _normalize_job_record(job: dict[str, Any]) -> dict[str, Any]:
     # Derived from the scheduler-honoured ``enabled`` flag so a half-paused record cannot render
     # "paused" while still firing. See effective_job_state().
     normalized["state"] = effective_job_state(normalized)
+    # Read-only running display uses the same fresh/dead-owner claim rule as dispatch.
+    if normalized["state"] == "scheduled" and _claim_is_live(
+            normalized.get("run_claim"), _hermes_now(), _oneshot_run_claim_ttl_seconds()):
+        normalized["state"] = "running"
     return normalized
 
 
@@ -1677,12 +1685,6 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
-def _normalize_job_optional_text(
-    value: Any, *, strip_trailing_slash: bool = False
-) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    return (value.strip().rstrip("/") if strip_trailing_slash else value.strip()) or None
 
 
 def _normalize_base_url(value: Any) -> Optional[str]:
@@ -1721,27 +1723,6 @@ def _normalize_failure_deliver(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value)
 
 
-def _normalize_reasoning_effort(value: Any) -> Optional[str]:
-    """Spelling-only validation via the shared parser (cron knob never stricter/looser than
-    config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
-    transports clamp at send time). None for unset, lowercase level, or ValueError."""
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    if not text:
-        return None
-    from hermes_constants import parse_reasoning_effort
-
-    if parse_reasoning_effort(text) is None:
-        raise ValueError(
-            f"Invalid reasoning_effort {value!r}. Valid levels: "
-            "none, minimal, low, medium, high, xhigh, max, ultra "
-            "(empty string clears the override).")
-    if text in {"false", "disabled"}:
-        return "none"
-    return text
-
-
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
 def _normalize_catch_up(value: Any) -> Optional[bool]:
@@ -1767,6 +1748,8 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "run_lock": _normalize_job_optional_text,
+    "script_output_format": normalize_script_output_format,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -1776,11 +1759,12 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
-    # ``0`` is a real grace value (never catch up), so this normalizer must never use an
-    # ``in {None, "", False}`` test — ``0 == False`` would silently clear it.
+    # Zero is a real grace value, not an unset value.
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "run_lock": _normalize_job_optional_text,
+    "script_output_format": normalize_script_output_format,
 }
 
 
@@ -1835,6 +1819,8 @@ def create_job(
     interpreter: Optional[str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    run_lock: Optional[str] = None,
+    script_output_format: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -1845,9 +1831,10 @@ def create_job(
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
-    (a venv can be rebuilt or moved after creation). timezone: IANA key pinning the schedule's
-    wall clock (None/'' = inherit the profile zone). grace_minutes: catch-up window override
-    (0 = never catch up)."""
+    (a venv can be rebuilt or moved after creation). timezone pins the schedule;
+    grace_minutes controls catch-up (zero means never). run_lock optionally names
+    a cross-producer consumer mutex. script_output_format opts into artifact delivery.
+    """
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
@@ -1872,7 +1859,7 @@ def create_job(
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
 
-    _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
+    validate_job_modes(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"], f["script_output_format"])
     validate_schedule_knobs(parsed_schedule, f["timezone"], f["grace_minutes"])
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
@@ -1939,6 +1926,7 @@ def create_job(
         ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
         ("catch_up", f["catch_up"]),
+        ("run_lock", f["run_lock"]), ("script_output_format", f["script_output_format"]),
     ):
         if value is not None:
             job[key] = value
@@ -2130,12 +2118,13 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         updated = _apply_skill_fields({**job, **updates})
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
-        if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
-            _validate_job_mode_invariants(
+        if {"monitor_script", "monitor_url", "no_agent", "script", "script_output_format"}.intersection(updates):
+            validate_job_modes(
                 updated.get("monitor_script") or None,
                 updated.get("monitor_url") or None,
                 bool(updated.get("no_agent")),
-                _normalize_job_optional_text(updated.get("script")))
+                _normalize_job_optional_text(updated.get("script")),
+                updated.get("script_output_format"))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
         if {"timezone", "grace_minutes"}.intersection(updates):

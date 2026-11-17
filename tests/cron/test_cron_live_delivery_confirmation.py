@@ -395,3 +395,12 @@ class TestStandaloneSendIsBounded:
 
         assert error is None
         assert f"delivered to telegram:{CHAT_ID}" in caplog.text
+
+
+def test_confirmed_send_clears_prior_unverified_evidence():
+    job = _job()
+    job["last_delivery_unverified"] = ["telegram:123"]
+    with patch("cron.jobs.update_job") as update:
+        sched_delivery._record_delivery_verification(job, [])
+    assert job["last_delivery_unverified"] is None
+    update.assert_called_once_with(job["id"], {"last_delivery_unverified": None})

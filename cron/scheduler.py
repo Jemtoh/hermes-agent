@@ -524,6 +524,8 @@ from cron.jobs import (
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
 from cron import store_health
+from cron.consumer_run_lock import (
+    _consumer_name, consumer_run_guard, reject_recursive_consumer_run)
 from cron.execution_identity import enter_cron_execution, exit_cron_execution
 from cron.executions import (
     FIRER_FINISHED_STATES, _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
@@ -1501,11 +1503,10 @@ def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
 def _run_no_agent_job(
     job: dict, job_id: str, job_name: str, cancel_event,
 ) -> tuple[bool, str, str, Optional[str]]:
-    """no_agent short-circuit — the script IS the job (no AIAgent, no tokens). stdout → delivered
-    verbatim; empty stdout or wakeAgent=false → silent success; non-zero exit/timeout → error alert.
+    """Run only the script: legacy stdout is verbatim; delivery-v1 validates saved artifacts.
+    Empty/wakeAgent=false is silent; script failures produce the existing error alert.
     """
-    # Load .env first so auto-delivery can resolve *_HOME_CHANNEL: the agent path's per-run dotenv
-    # reload never runs for no_agent jobs. Does not override existing values.
+    # No-agent jobs need their own dotenv load for *_HOME_CHANNEL routing.
     try:
         from hermes_cli.env_loader import load_hermes_dotenv
 
@@ -1514,7 +1515,7 @@ def _run_no_agent_job(
         logger.debug("Job '%s': no_agent .env reload failed", job_id, exc_info=True)
 
     script_path = job.get("script")
-    # Legacy/hand-edited no_agent job without a script: pause it, or it re-fires every tick.
+    # Pause malformed jobs so they cannot refire every tick.
     if not str(script_path or "").strip():
         from cron.jobs_invariants import NO_AGENT_WITHOUT_SCRIPT_ERROR
 
@@ -1533,7 +1534,6 @@ def _run_no_agent_job(
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
 
     if not ok:
-        # Deliver the error: a silently broken watchdog is the worst-case outcome.
         alert = (
             f"⚠ Cron watchdog '{job_name}' script failed\n\n"
             f"{output}\n\n"
@@ -1541,7 +1541,10 @@ def _run_no_agent_job(
         )
         return False, f"{header}**Status:** script failed\n\n{output}\n", alert, output
 
-    # wakeAgent=false is a silent signal, same as empty stdout.
+    if job.get("script_output_format"):
+        from cron.artifact_delivery import no_agent_result
+        return no_agent_result(job, output, header)
+
     if not _parse_wake_gate(output):
         logger.info("Job '%s' (no_agent): wakeAgent=false gate — silent run", job_id)
         return True, f"{header}**Status:** silent (wakeAgent=false)\n", SILENT_MARKER, None
@@ -2663,6 +2666,10 @@ def run_job(
         _worker_teardown_deferred = defer_teardown_to_running_worker(
             _worker_state.get("future"), _session_db, agent, job_id, job_name, _cron_session_id,
             workdir=scope.workdir)
+        if _worker_teardown_deferred:
+            # Still-running conversation after a cancel/interrupt: the owner keeps the consumer
+            # mutex until this future completes (cron.consumer_run_lock.keep_until).
+            job["_deferred_worker"] = _worker_state.get("future")
         scope.exit()
         if _session_db and not _worker_teardown_deferred:
             _finalize_cron_session(_session_db, agent, job_id, job_name, _cron_session_id,
@@ -2803,9 +2810,8 @@ def run_one_job(
     claim (callers use the store CAS) but keeps it alive. True if processed (a job failure is
     recorded via ``mark_job_run``), False only if processing raised. ``cancel_event``: optional
     transport-level cancel (dashboard drain)."""
-    # Every gateway path (built-in scheduler, external providers, and direct
-    # API fires) crosses this seam.  Ensure the detached worker has a durable
-    # attempt to adopt before any launch can occur.
+    reject_recursive_consumer_run(job)
+    # Give every producer a durable attempt before worker handoff.
     if not job.get("execution_id"):
         execution = create_execution(
             job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
@@ -2879,17 +2885,19 @@ def run_one_job(
             fire_owner or None, profile_home)
     try:
         with self_removal_delivery_scope(job["id"]):
-            return _run_with_fire_claim_heartbeat(
-                job,
-                lambda lost_ownership: _run_one_job_body(
-                    job,
-                    adapters=adapters,
-                    loop=loop,
-                    verbose=verbose,
-                    extra_prompt=extra_prompt,
-                    claim_lost=lost_ownership,
-                    transport_cancel=cancel_event,
-                    execution_token=execution_token))
+            # The consumer mutex spans admission → computation → SAVED OUTPUT, so a second
+            # producer cannot preflight against a report this run is still writing. The canonical
+            # owner joins this same hold on its own thread (gateway/session_cron._run_identified),
+            # so a post-admission observer disconnect no longer frees the consumer while the owner
+            # computes, and the owner never collides with its own firer.
+            with consumer_run_guard(job, execution_id) as may_run:
+                if not may_run:
+                    return True
+                return _run_with_fire_claim_heartbeat(
+                    job, lambda lost_ownership: _run_one_job_body(
+                        job, adapters=adapters, loop=loop, verbose=verbose,
+                        extra_prompt=extra_prompt, claim_lost=lost_ownership,
+                        transport_cancel=cancel_event, execution_token=execution_token))
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(_fire_key)
@@ -3192,6 +3200,7 @@ def _deliver_crash_failure(
         delivery_error=delivery_error, should_deliver=True, unresolved_origin=unresolved_origin,
         normalized_deliver=normalized_deliver, incident_acked=False, success=False,
         delivery_queued=job.get("last_delivery_queued"),
+        delivery_unverified=job.get("last_delivery_unverified"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")))
     if delivery_outcome in ("delivered", "not_configured"):
         _mark_incident_alerted(failure_incident_id)
@@ -3270,6 +3279,71 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
+def _settle_refusal(job: dict, execution_id: str) -> bool:
+    """True when the owner refused before any computation (busy consumer / spent dispatch).
+
+    Such a fire settles as an unstarted run through this firer's own owner-fenced claims, never as
+    an ordinary failure, delivery or incident.
+    """
+    if not job.get("_consumer_refusal"):
+        return False
+    _settle_unstarted_refusal(job, execution_id)
+    return True
+
+
+def _admit_dispatch(job: dict) -> bool:
+    """Whether this fire may run: claim the one-shot dispatch, or leave it to the consumer's owner.
+
+    A consumer-locked AGENT job is admitted by the owner, which spends its finite dispatch only
+    after the consumer mutex is actually held — a refusal must never consume a one-shot.
+    """
+    if _consumer_name(job) and not job.get("no_agent"):
+        return True
+    return bool(claim_dispatch(job["id"]))
+
+
+def _settle_unstarted_refusal(job: dict, execution_id: str) -> None:
+    """Book a consumer refusal precisely: unstarted ledger row, this owner's claims retired."""
+    from cron.consumer_run_lock import release_unstarted_fire
+    from cron.executions import settle_unstarted_execution
+
+    job_id = str(job.get("id") or "")
+    claim = job.get("fire_claim")
+    owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    try:
+        release_unstarted_fire(
+            job_id, owner, expected_manual_run_at=job.get("manual_run_at"),
+            expected_run_claim=job.get("run_claim"))
+    except Exception:
+        logger.warning("Consumer refusal: claim cleanup failed for job %s", job_id, exc_info=True)
+    settle_unstarted_execution(str(execution_id), job_id, str(job["_consumer_refusal"]))
+
+
+def _settle_late_ownership_loss(d, transport_cancelled: bool, job: dict, fire_owner,
+                                execution_id: str) -> bool:
+    """Book a claim miss observed AFTER the run finished; True when the run is already settled.
+
+    #105861: the claim check is one sample; a miss AFTER a completed delivery must not overwrite
+    the delivered run's terminal status — ok, or a failure whose notice already left with its real
+    error — so the delivered run falls through to ``finish_completed_run``, whose owner-fenced
+    ``mark_job_run`` is authoritative either way. An explicit transport cancel stays fail-closed.
+    Split out of ``_run_one_job_body`` to keep that function inside the code-health complexity cap.
+    """
+    if d.delivery_attempted and not d.delivery_error and not transport_cancelled:
+        logger.warning(
+            "Job '%s': fire claim ownership lost after completed delivery; "
+            "recording the delivered run's terminal status",
+            job["id"])
+        return False
+    if transport_cancelled:
+        logger.warning(
+            "Job '%s': transport cancellation arrived before terminal completion; "
+            "recording the interrupted run",
+            job["id"])
+    _record_fire_ownership_lost(job, fire_owner, execution_id)
+    return True
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
@@ -3304,7 +3378,7 @@ def _run_one_job_body(
         # re-fire it forever on restart. No-op for recurring/infinite jobs (at-most-times).
         # This lives here in the shared body so BOTH the built-in ticker and the external provider (Chronos
         # fire_due) get at-most-times semantics. See #38758.
-        if not claim_dispatch(job["id"]):
+        if not _admit_dispatch(job):
             logger.info(
                 "Job '%s': one-shot dispatch limit reached — skipping",
                 job.get("name", job["id"]))
@@ -3385,25 +3459,9 @@ def _run_one_job_body(
         from cron.scheduler_bookkeeping import fail_empty_response
         fail_empty_response(d, final_response)
 
-        if _fire_claim_ownership_lost():
-            # #105861: the claim check is one sample; a miss AFTER a completed delivery must not
-            # overwrite the delivered run's terminal status — ok, or a failure whose notice already
-            # left with its real error — so fall through to finish_completed_run, whose owner-fenced
-            # mark_job_run is authoritative either way. An explicit transport cancel stays fail-closed.
-            transport_cancelled = fence.transport_cancelled()
-            if d.delivery_attempted and not d.delivery_error and not transport_cancelled:
-                logger.warning(
-                    "Job '%s': fire claim ownership lost after completed delivery; "
-                    "recording the delivered run's terminal status",
-                    job["id"])
-            else:
-                if transport_cancelled:
-                    logger.warning(
-                        "Job '%s': transport cancellation arrived before terminal completion; "
-                        "recording the interrupted run",
-                        job["id"])
-                _record_fire_ownership_lost(job, fire_owner, execution_id)
-                return True
+        if _fire_claim_ownership_lost() and _settle_late_ownership_loss(
+                d, fence.transport_cancelled(), job, fire_owner, execution_id):
+            return True
 
         if _consume_interrupted_flag(job["id"], execution_token):
             from cron.scheduler_bookkeeping import finish_interrupted_run

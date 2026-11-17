@@ -37,3 +37,43 @@ def test_given_up_fire_leaves_its_attempt_recoverable_not_running(tmp_path, monk
         scheduler_authority.reconcile_pending()
         assert executions.get_execution(fire)['status'] == 'completed'
         assert not journal.exists()
+
+
+def test_given_up_row_is_recovered_into_the_precise_unstarted_verdict(tmp_path, monkeypatch):
+    """``unknown`` is recoverable, not settled: the guarded recovered transition replaces a
+    given-up row with the precise unstarted refusal instead of dropping the receipt and leaving
+    the ledger on an old uncertainty error."""
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        fire = executions.create_execution(job['id'], source='test')['id']
+        executions.mark_execution_running(fire)
+        journal = scheduler_authority.journal_path(job['id'], fire)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text(json.dumps({'params': {'job_id': job['id'], 'request_id': fire,
+                                                  'extra_prompt': None},
+                                       'receipt': {'session_id': 's', 'admission_id': 'a'}}))
+        # The ACTUAL give-up transition its own firer books.
+        assert executions.give_up_execution(fire, reason='Cron execution unverified: dropped') is True
+        assert executions.get_execution(fire)['status'] == 'unknown'
+
+        spent = {'sent': [], 'marks': []}
+        monkeypatch.setattr(scheduler, '_deliver_result', lambda *a, **kw: spent['sent'].append(True))
+        monkeypatch.setattr(scheduler, 'mark_job_run', lambda *a, **kw: spent['marks'].append(True))
+
+        class Peer:
+            async def rpc(self, method, **params):
+                return {'status': 'terminal', 'job': job,
+                        'result': [False, 'document', '', 'held; not started'],
+                        'job_flags': {'_consumer_refusal': 'held; not started'}}
+
+        @asynccontextmanager
+        async def connected():
+            yield Peer()
+        monkeypatch.setattr(gateway_client, 'connect_gateway', connected)
+        scheduler_authority.reconcile_pending()
+
+        settled = executions.get_execution(fire)
+        assert settled['status'] == 'failed', 'unknown must not read as already settled'
+        assert settled['error'] == 'held; not started', 'the precise refusal replaces the uncertainty'
+        assert not journal.exists()
+        assert spent == {'sent': [], 'marks': []}, 'an unstarted refusal is not a failure run'

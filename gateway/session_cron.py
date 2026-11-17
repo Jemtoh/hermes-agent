@@ -155,7 +155,7 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
 # Run-side verdicts run_job stamps on the job dict for the firing scheduler's bookkeeping tail
 # (cron/quota_hold.py parks past a closed usage window; cron/unreachable_retry.py re-runs a
 # never-reached model). They cross the authority boundary inside the cron result.
-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds')
+RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_consumer_refusal')
 
 
 async def operation(authority, name, params, actor=None):
@@ -263,14 +263,42 @@ def _run_identified(run_job, job, execution_id, **kwargs):
 
     The scheduler binds it in the FIRING thread, but the owner executes on its own loop, whose
     context never saw that binding; re-bind it here from the same ledger row, in the profile scope
-    the caller entered (so the row and the profile name are this profile's)."""
+    the caller entered (so the row and the profile name are this profile's).
+
+    The consumer mutex is taken HERE, around the body that actually computes: the firer's own
+    guard deliberately does not span an agent handoff, so this hold is what survives the firer's
+    observer disconnecting (``CronExecutionUnknown``) while the computation continues. A refusal
+    runs no script/model/send and books only this attempt's unstarted claims.
+    """
+    from cron.consumer_run_lock import (
+        consumer_hold_survives_run, consumer_run_guard, refusal_reason)
+
     from cron.execution_identity import enter_cron_execution, exit_cron_execution
     from cron.executions import get_execution
-    token = enter_cron_execution(job, execution_id, get_execution(execution_id) or {})
-    try:
-        return run_job(job, execution_id=execution_id, **kwargs)
-    finally:
-        exit_cron_execution(token)
+    from cron.jobs import claim_dispatch
+
+    def _refuse(reason: str):
+        # A typed, unstarted verdict: the FIRER settles it from its own owner-fenced claims, so a
+        # cross-process refusal is never mis-booked as generic claim loss or a normal failure.
+        job['_consumer_refusal'] = reason
+        return (False, f"# Cron Job: {job.get('id')} (FAILED)\n\n{reason}\n", "", reason)
+
+    with consumer_run_guard(job, execution_id, settle=False) as may_run:
+        if not may_run:
+            return _refuse(refusal_reason(job))
+        if job.get('run_lock') and not claim_dispatch(job.get('id')):
+            return _refuse('Dispatch claim rejected; execution was not started.')
+        token = enter_cron_execution(job, execution_id, get_execution(execution_id) or {})
+        try:
+            return run_job(job, execution_id=execution_id, **kwargs)
+        finally:
+            exit_cron_execution(token)
+            # A cancelled/timed-out conversation can outlive this call: the consumer stays held
+            # until that worker actually exits. Past the owner's computation the durable admission
+            # journal is what excludes another execution (cron.consumer_run_lock), so this hold is
+            # the live-computation span, not the report-saving span.
+            consumer_hold_survives_run(
+                job.get('run_lock') or '', execution_id, job.get('_deferred_worker'))
 
 
 async def execute(authority, ref, row, policy):

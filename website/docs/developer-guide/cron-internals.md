@@ -96,8 +96,8 @@ Desktop routine inspector) maps each literal explicitly — a consumer must neve
 
 | Literal | Meaning | Detail field |
 |---------|---------|--------------|
-| `ok` | Agent run succeeded and (if targeted) delivery was confirmed | — |
-| `delivery_queued` | Agent run succeeded; its send was handed to the durable delivery queue and has not settled yet (transitional) | `last_delivery_queued` |
+| `ok` | Agent run succeeded; check delivery evidence separately | `last_delivery_unverified` when confirmation is missing |
+| `delivery_queued` | Agent run succeeded; its send is queued and has not settled | `last_delivery_queued` |
 | `error` | Agent run failed | `last_error` |
 | `delivery_failed` | Agent run succeeded, but the output never reached its target | `last_delivery_error` (`last_error` is `null`) |
 | `blocked_config` | Pre-dispatch validation refused to burn a run | `last_error` |
@@ -129,6 +129,12 @@ attempt and latest recorded completion), so the call is idempotent and never rew
 later run's status; the ledger only ever moves `queued` to a terminal outcome. Until a
 gateway drains the row, `last_status` stays `delivery_queued` and `hermes cron list`
 shows "finished; delivery is still in progress".
+A live adapter send that has started but exceeds the confirmation wait keeps running;
+standalone fallback is skipped to avoid duplicates. The target is recorded in
+`last_delivery_unverified`, and the execution records `delivery_outcome=unverified`.
+Gateway-queued unverified sends become terminal `unknown` in the existing queue,
+with payloads redacted and no retry. Neither state proves delivery; late receipts
+are not reconciled automatically.
 
 ### Job Lifecycle States
 

@@ -52,6 +52,44 @@ def _lift_pause(job_id, pause):
             pass
 
 
+def _lift_unstarted_pause(job_id, pause):
+    """Clear EXACTLY the uncertainty pause an unstarted verdict resolved — decided and written in
+    one locked read-modify-write, so a newer operator pause can never land between the two.
+
+    Schedule-preserving by construction: no ``resume_job``, which recomputes ``next_run_at`` and
+    would drop the queued run-now the refusal preserved (and refuses a past one-shot outright).
+
+    Returns (the fence is what makes them distinguishable):
+
+    * ``None``/``True`` — nothing owed, or the lift ran: the pause was not ours, or the job is
+      gone, or it was cleared. All of these settle the uncertainty, so the receipt may go.
+    * ``False`` — the fence was never acquired, so nothing was read and nothing written. That is
+      RETRYABLE, not a no-op: the caller must keep its receipt and replay the lift.
+    """
+    if not isinstance(pause, dict):
+        return None
+    from cron.jobs import _activate_job_record, _under_fire_fence, _with_job, save_jobs
+
+    def apply(jobs, _i, job):
+        if (job.get('state') != 'paused'
+                or (job.get('paused_at'), job.get('paused_reason')) != (pause['paused_at'], pause['reason'])):
+            return False  # an operator's own later pause (or resume) is not ours to touch
+        _activate_job_record(job)
+        save_jobs(jobs)
+        return True
+
+    fenced = []
+
+    def locked():
+        fenced.append(True)  # provenance: the fence ran, so a False below is a decision, not a denial
+        return _with_job(job_id, apply, False)
+
+    _under_fire_fence(job_id, locked)
+    if not fenced:
+        return False
+    return True
+
+
 def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
     from gateway.session_cron import owner_for_home, operation
     from hermes_cli.gateway_client import connect_gateway
@@ -66,10 +104,19 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
     root = get_hermes_home() / 'cron' / 'admissions'
     journal = journal_path(params['job_id'], params['request_id'])
     record = {'params': params, 'receipt': None}
+    from cron.consumer_run_lock import _consumer_name
+
+    consumer = _consumer_name(job)
+    if consumer:
+        # The durable exclusion ACROSS owner loss: this fire's own OS hold is owned by our caller
+        # right now, and this journal outlives us until the attempt is booked terminal.
+        record['consumer'] = {'name': consumer, 'request_id': params['request_id']}
     if journal.exists():
         record = json.loads(journal.read_text(encoding='utf-8-sig'))
         if record['params'] != params:
             raise CronExecutionUnknown('cron admission identity conflict')
+        if consumer:
+            record['consumer'] = {'name': consumer, 'request_id': params['request_id']}
     attempted = journal.exists()
     owner = owner_for_home(get_hermes_home())
 
@@ -118,7 +165,16 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 await asyncio.to_thread(touch_execution_progress, request_id)
             if state['status'] == 'terminal':
                 job.update(state.get('job_flags') or {})
-                return tuple(state['result'])
+                result = tuple(state['result'])
+                if job.get('_consumer_refusal'):
+                    # The verdict is durable BEFORE this firer can die: recovery must settle the
+                    # fire as unstarted, never save output or book a failure for it.
+                    record['refusal'] = list(result)
+                    record['unstarted'] = True
+                    record['job'] = dict(state.get('job') or job)
+                    save()
+                return result
+
             if state['status'] == 'unknown':
                 raise CronExecutionUnknown('unknown_execution: cron admission was not replayed')
             await asyncio.sleep(delay)
@@ -145,6 +201,57 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
         error = f'{type(exc).__name__}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
+
+def _settle_recovered_unstarted(job, params, journal, pause=None) -> bool:
+    """Book a DEAD firer's unstarted refusal once: ledger row, this fire's claims, then the receipt.
+
+    The row is not this process's, so only the guarded recovered-settlement may write it; a live
+    owner (or any refusal of that write) leaves the journal in place, which keeps the consumer's
+    durable fence. Only after the row is settled are the fire's own claims retired — never a
+    newer claim, because ``release_unstarted_fire`` matches the recorded owner — and only then is
+    the recovery-owned pause lifted and the receipt dropped. Every step before that is replayable.
+    False, with the journal retained, is returned when the pause lift's fence was unavailable.
+    """
+    import logging
+
+    from cron.consumer_run_lock import release_unstarted_fire
+    from cron.executions import _TERMINAL_STATES, get_execution, settle_recovered_unstarted
+
+    job_id = params['job_id']
+    execution_id = params['request_id']
+    row = get_execution(execution_id)
+    if row is not None and row['job_id'] != job_id:
+        # A terminal row belonging to ANOTHER job never grants cleanup or deletion.
+        logging.getLogger(__name__).warning(
+            'Cron unstarted recovery: execution %s belongs to job %s, not %s',
+            execution_id, row['job_id'], job_id)
+        return False
+    # ``unknown`` is RECOVERABLE, not settled: a given-up or dead-owner row is the one this
+    # guarded recovered transition exists to resolve into the precise unstarted verdict.
+    if not (row is not None and row['status'] in _TERMINAL_STATES and row['status'] != 'unknown'):
+        if not settle_recovered_unstarted(execution_id, job_id, str(job['_consumer_refusal'])):
+            return False
+    claim = job.get('fire_claim')
+    owner = str(claim.get('by') or '') if isinstance(claim, dict) else ''
+    try:
+        release_unstarted_fire(job_id, owner, expected_run_claim=job.get('run_claim'))
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'Cron unstarted recovery: claim cleanup failed for %s', job_id, exc_info=True)
+        return False
+    # The uncertainty that paused the schedule was this fire's own; the verdict just resolved it.
+    # Lifting before the receipt goes keeps the job (and the queued intent) in one atomically
+    # replayable state, and the locked identity guard still leaves an operator's pause alone.
+    if _lift_unstarted_pause(job_id, pause) is False:
+        # The fence never ran, so the automatic pause is still in place and this receipt is the only
+        # record of whose it is. Dropping it would strand the pause with nothing left to lift it.
+        # The row and this fire's claims are already settled, so the replay below is the lift alone.
+        logging.getLogger(__name__).warning(
+            'Cron unstarted recovery: pause lift fence unavailable for %s; receipt retained', job_id)
+        return False
+    journal.unlink(missing_ok=True)
+    return True
+
 
 def reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
@@ -175,9 +282,13 @@ def reconcile_pending(*, allow_connect=True):
                 # output or re-marking the job on every tick would duplicate its side effects.
                 continue
             row = get_execution(params['request_id'])
-            if row is not None and row['job_id'] == params['job_id'] and row['status'] in FIRER_FINISHED_STATES:
+            if (row is not None and row['job_id'] == params['job_id']
+                    and row['status'] in FIRER_FINISHED_STATES
+                    and not record.get('unstarted')):
                 # The firer booked this attempt's terminal outcome itself (ownership lost, shutdown
                 # interrupt, a crashed tail): the receipt is not a result to save or deliver again.
+                # An UNSTARTED verdict is exempt: its ledger row may be booked while the exact
+                # claim cleanup that preserves the queued intent still has to be replayed.
                 journal.unlink(missing_ok=True)
                 continue
             if 'refusal' in record:
@@ -213,6 +324,21 @@ def reconcile_pending(*, allow_connect=True):
                 continue
             success, output, answer, error = state['result']
             job = dict(state['job'], **(state.get('job_flags') or {}))
+            if record.get('unstarted') and not job.get('_consumer_refusal'):
+                job['_consumer_refusal'] = str(error or '')
+            if job.get('_consumer_refusal'):
+                # A typed unstarted verdict: the fire computed nothing. Its journal is made
+                # COMPLETE before any settlement write, so a settlement that dies half-way (or a
+                # claim cleanup that fails once) is replayed by the next pass from disk instead of
+                # being read as a firer-finished attempt. Then settle it through the DEAD firer's
+                # ledger row and owner-fenced claims — no output, no notice, no incident, and the
+                # finite dispatch / queued run-now the refusal preserved stay intact.
+                record['refusal'] = [success, output, answer, error]
+                record['unstarted'] = True
+                record['job'] = dict(job)
+                atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+                _settle_recovered_unstarted(job, params, journal, record.get('pause_recorded'))
+                continue
             job['execution_id'] = params['request_id']
             # The same result verdicts as the ordinary tail: an agent-declared [CRON_FAILURE] and a
             # blank answer are failures, whichever process books them.
@@ -221,10 +347,18 @@ def reconcile_pending(*, allow_connect=True):
             # The canonical receipt supplies the result; a dead scheduler's fire claim does not
             # authorize replay and must not prevent finishing its durable bookkeeping.
             fence = _FireOwnership(dict(job, fire_claim=None))
-            _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
-                                 verbose=False, execution_token=None)
-            fail_empty_response(delivery, answer)
-            if finish_completed_run(delivery, None, params['request_id'], recovered=True):
+            # Exclusion must survive the owner's computation: its hold is kept until this row is
+            # terminal, and this save JOINS that same fire (same execution id) before writing.
+            from cron.consumer_run_lock import consumer_run_guard
+
+            with consumer_run_guard(job, params['request_id'], settle=False) as may_save:
+                if not may_save:
+                    continue  # a live producer owns the consumer; the next tick retries
+                _save_compose_deliver(delivery, fence, answer, output, adapters=None, loop=None,
+                                     verbose=False, execution_token=None)
+                fail_empty_response(delivery, answer)
+                completed = finish_completed_run(delivery, None, params['request_id'], recovered=True)
+            if completed:
                 _lift_pause(params['job_id'], record.get('pause_recorded'))
         except Exception:
             logging.getLogger(__name__).warning('Cron receipt recovery deferred: %s', journal, exc_info=True)

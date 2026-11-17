@@ -8,6 +8,8 @@ to match the claim-time fingerprint is not proof of death. Terminal states are i
 from __future__ import annotations
 
 import logging
+import json
+import hashlib
 import math
 import os
 import sqlite3
@@ -96,6 +98,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    add_column_if_missing(conn, "executions", "delivery_receipt", "delivery_receipt TEXT")
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_request_key "
+                     "ON executions(json_extract(delivery_receipt, '$.request_key')) "
+                     "WHERE delivery_receipt IS NOT NULL "
+                     "AND json_extract(delivery_receipt, '$.state') != 'failed_certain'")
+    except sqlite3.OperationalError:
+        logger.warning("Artifact delivery JSON index unavailable; opt-in sends are fenced")
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
@@ -134,10 +144,10 @@ def _widen_status_check(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(*, immediate: bool = False) -> Iterator[sqlite3.Connection]:
     from hermes_cli.sqlite_util import transaction
 
-    with _lock, transaction(_connect()) as conn:
+    with _lock, transaction(_connect(), immediate=immediate) as conn:
         yield conn
 
 
@@ -237,7 +247,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown','cancelled','missed')
+             WHERE status IN ('completed','failed','unknown','cancelled','missed') AND delivery_receipt IS NULL
              ORDER BY julianday(finished_at) DESC, finished_at DESC,
                       julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
@@ -352,12 +362,16 @@ def finish_execution(
 
     Only the owning process may finish its attempt; receipt recovery for a departed owner
     settles through ``recover_receipted_execution``.
+    The receipt is reread INSIDE this transaction: a late provider proof that already
+    settled an opt-in request to ``verified`` outranks the outcome the caller computed
+    from the send call it saw time out, so a stale timeout cannot clobber it.
     """
     now = _hermes_now().isoformat()
     status = "cancelled" if cancelled else ("completed" if success else "failed")
     detail = None if success else (str(error) if error else "unknown failure")
-    with _transaction() as conn:
+    with _transaction(immediate=True) as conn:
         owner = (_PROCESS_ID, os.getpid())
+        delivery_outcome = _receipt_delivery_outcome(_fetch(conn, execution_id), delivery_outcome)
         cur = conn.execute(
             """UPDATE executions
                SET status=?, finished_at=?, error=?, handoff_pending=0,
@@ -449,6 +463,18 @@ def execution_owner_live(execution_id: str, job_id: str) -> bool:
     return row is not None and _row_owner_live(row)
 
 
+def settle_recovered_unstarted(execution_id: str, job_id: str, error: str) -> bool:
+    """Settle an attempt that never computed after its firer is gone; True when it is settled.
+
+    The row belongs to the DEAD firer, so ``finish_execution`` (owner-fenced to this process)
+    cannot write it. This is the same guarded transition recovery uses for a completed receipt:
+    the row must be this job's attempt and its owner must be provably dead. False leaves the
+    receipt (and the consumer's durable admission fence) untouched for a later reconciliation.
+    """
+    return recover_receipted_execution(
+        execution_id, job_id, success=False, error=error) is not None
+
+
 def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
     """Replace a terminal attempt's ``queued`` delivery outcome with the drain's real one.
 
@@ -489,7 +515,8 @@ def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> No
 def recover_interrupted_executions() -> int:
     """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
     dead, plus rows whose live owner holds a claim older than the derived stale bound (the
-    process is not killed)."""
+    process is not killed). Positively dead owners also release never-claimed artifact
+    receipts, including orphan anchors on already terminal execution rows."""
     now = _hermes_now().isoformat()
     changed = 0
     recovered: list[dict[str, Any]] = []
@@ -497,6 +524,14 @@ def recover_interrupted_executions() -> int:
     # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
     stale_after: Optional[float] = None
     stale_after_resolved = False
+    with _transaction(immediate=True) as conn:
+        for receipt_row in conn.execute(
+            "SELECT * FROM executions WHERE delivery_receipt IS NOT NULL"
+        ).fetchall():
+            if _retire_dead_unsent_receipt(conn, receipt_row):
+                recovered.append(_fetch(conn, receipt_row["id"]))
+    # Keep run-owner reconciliation separate: adoption can change a claim while
+    # liveness is checked, and its existing owner CAS protects that race.
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
@@ -557,6 +592,9 @@ def recover_interrupted_executions() -> int:
                     recovered.append(record)
         if changed:
             _prune_unlocked(conn)
+        # Emit the final row once when receipt retirement and run terminalization coincide.
+        recovered = [_fetch(conn, execution_id) for execution_id in
+                     dict.fromkeys(record["id"] for record in recovered)]
     for record in recovered:
         _emit_execution_state(record)
     return changed
@@ -582,13 +620,15 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
     worker that is still running must never be terminalized out from under itself.
     """
     now = _hermes_now().isoformat()
-    with _transaction() as conn:
+    with _transaction(immediate=True) as conn:
         row = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at
-               FROM executions WHERE id=?""",
+            """SELECT * FROM executions WHERE id=?""",
             (execution_id,),
         ).fetchone()
+        if row is not None:
+            _retire_dead_unsent_receipt(conn, row)
+    with _transaction() as conn:
+        row = conn.execute("SELECT * FROM executions WHERE id=?", (execution_id,)).fetchone()
         if row is None or row["status"] not in ("claimed", "running"):
             return False
         if row["process_id"] == _PROCESS_ID:
@@ -753,3 +793,392 @@ def latest_executions(job_ids: list[str]) -> dict[str, dict[str, Any]]:
             clean,
         ).fetchall()
     return {row["job_id"]: dict(row) for row in rows}
+
+
+def _delivery_identity(request: dict) -> tuple[str, str]:
+    from cron.artifact_delivery import _hex, _keys
+
+    _keys(request, ('token', 'purpose', 'target', 'message_sha256', 'artifacts'))
+    _hex(request['token'], 32)
+    _hex(request['message_sha256'], 64)
+    if request['purpose'] not in ('report', 'review'):
+        raise ValueError('invalid artifact purpose')
+    target = request['target']
+    _keys(target, ('platform', 'chat_id', 'thread_id'))
+    if target['platform'] != 'telegram' or not isinstance(target['chat_id'], str) or not target['chat_id']:
+        raise ValueError('artifact delivery requires a Telegram target')
+    if target['thread_id'] is not None and not isinstance(target['thread_id'], str):
+        raise ValueError('invalid artifact thread')
+    if not isinstance(request['artifacts'], list) or not request['artifacts']:
+        raise ValueError('artifact identity requires evidence')
+    kinds = set()
+    for artifact in request['artifacts']:
+        _keys(artifact, ('kind', 'sha256', 'transport', 'size'))
+        kind = artifact['kind']
+        allowed = ('report',) if request['purpose'] == 'report' else ('review', 'review_result')
+        if not isinstance(kind, str) or kind not in allowed or kind in kinds:
+            raise ValueError('invalid or duplicate artifact identity')
+        kinds.add(kind)
+        _hex(artifact['sha256'], 64)
+        if artifact['transport'] not in ('text', 'document'):
+            raise ValueError('invalid artifact transport')
+        if type(artifact['size']) is not int or artifact['size'] < 0:
+            raise ValueError('invalid artifact size')
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return request['purpose'] + ':' + request['token'], digest
+
+
+def _receipt_records(conn, key):
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_delivery_request_key'").fetchone():
+        raise ValueError('artifact delivery requires SQLite JSON index support')
+    return conn.execute(
+        "SELECT * FROM executions WHERE json_extract(delivery_receipt, '$.request_key')=? "
+        "ORDER BY claimed_at DESC, id DESC", (key,)).fetchall()
+
+
+def _decode_receipt(row):
+    receipt = json.loads(row['delivery_receipt'])
+    if not isinstance(receipt, dict) or not isinstance(receipt.get('request'), dict):
+        raise ValueError('corrupt artifact receipt anchor')
+    key, digest = _delivery_identity(receipt['request'])
+    if (type(receipt.get('version')) is not int or receipt.get('version') != 1
+            or receipt.get('execution_id') != row['id']
+            or receipt.get('request_key') != key or receipt.get('request_sha256') != digest
+            or receipt.get('state') not in ('unsent', 'sending', 'verified', 'failed_certain', 'unknown', 'suppressed')):
+        raise ValueError('corrupt artifact receipt anchor')
+    if receipt['state'] == 'verified':
+        from cron.artifact_proof import evidence as validate_evidence
+
+        validate_evidence(receipt.get('evidence'), receipt)
+    return receipt
+
+
+def _delivery_owner_is_dead(row) -> bool:
+    from gateway.status import _pid_exists
+
+    try:
+        if not _pid_exists(row['pid']):
+            return True
+        if row['process_started_at'] is None:
+            return False
+        return not _owner_is_live(row['pid'], row['process_started_at'])
+    except Exception:
+        logger.warning('Artifact owner liveness is unverifiable; keeping fence', exc_info=True)
+        return False
+
+
+def _retire_dead_unsent_receipt(conn, row) -> bool:
+    """Retire only a positively dead owner's never-claimed anchor, under the caller's lock.
+
+    Queue claims take the same immediate execution transaction: either the sender wins
+    and this leaves its attempt fenced, or retirement wins and the old anchor cannot send.
+    Terminal execution rows are eligible because a previous reaper may have closed the run.
+    """
+    if not row['delivery_receipt']:
+        return False
+    if (row['handoff_pending'] and row['handoff_started_at'] is not None
+            and time.time() - float(row['handoff_started_at']) < HANDOFF_ADOPTION_GRACE_SECONDS):
+        return False
+    try:
+        receipt = _decode_receipt(row)
+    except (ValueError, TypeError, KeyError):
+        logger.warning('Corrupt artifact anchor; keeping dead-owner delivery fence')
+        return False
+    if (receipt['state'] != 'unsent' or receipt.get('attempt_nonce') is not None
+            or receipt.get('evidence') is not None or not _delivery_owner_is_dead(row)):
+        return False
+    receipt.update(state='failed_certain', reason='owner exited before dispatch',
+                   settled_at=_hermes_now().isoformat())
+    return conn.execute(
+        'UPDATE executions SET delivery_receipt=?, delivery_outcome=? '
+        'WHERE id=? AND delivery_receipt=? AND process_id=? AND pid=? AND process_started_at IS ?',
+        (json.dumps(receipt), 'failed', row['id'], row['delivery_receipt'], row['process_id'],
+         row['pid'], row['process_started_at'])).rowcount == 1
+
+
+def prepare_delivery_request(execution_id: str, job_id: str, request: dict) -> dict:
+    """Bind an owned execution to immutable ID/hash metadata before any dispatch."""
+    key, digest = _delivery_identity(request)
+    with _transaction(immediate=True) as conn:
+        owner = _fetch(conn, execution_id)
+        if (not owner or owner['job_id'] != job_id or owner['process_id'] != _PROCESS_ID
+                or owner['pid'] != os.getpid() or owner['status'] not in ('claimed', 'running')):
+            raise ValueError('artifact request execution is not owned and active')
+        active = None
+        for row in _receipt_records(conn, key):
+            receipt = _decode_receipt(row)
+            if receipt['request_sha256'] != digest:
+                raise ValueError('artifact request identity conflict')
+            if _retire_dead_unsent_receipt(conn, row):
+                continue
+            elif receipt['state'] != 'failed_certain':
+                if active is not None:
+                    raise ValueError('duplicate active artifact request')
+                active = receipt
+        if active is not None:
+            return active
+        if owner.get('delivery_receipt') is not None:
+            raise ValueError('execution already has an artifact request')
+        receipt = {'version': 1, 'execution_id': execution_id, 'request_key': key,
+                   'request_sha256': digest, 'request': request, 'state': 'unsent'}
+        changed = conn.execute(
+            "UPDATE executions SET delivery_receipt=? WHERE id=? AND job_id=? "
+            "AND process_id=? AND pid=? AND status IN ('claimed','running') AND delivery_receipt IS NULL",
+            (json.dumps(receipt), execution_id, job_id, _PROCESS_ID, os.getpid())).rowcount
+        if changed != 1:
+            raise ValueError('artifact request ownership changed')
+        return receipt
+
+
+def claim_delivery_request(execution_id: str, request_sha256: str) -> Optional[dict]:
+    """Exactly one sender wins; queued workers retain their original execution anchor."""
+    with _transaction(immediate=True) as conn:
+        row = _fetch(conn, execution_id)
+        if not row or not row.get('delivery_receipt'):
+            raise ValueError('artifact request anchor is missing')
+        receipt = _decode_receipt(row)
+        if receipt['request_sha256'] != request_sha256:
+            raise ValueError('artifact request digest conflict')
+        if receipt['state'] != 'unsent':
+            return None
+        receipt.update(state='sending', attempt_nonce=uuid.uuid4().hex, sender_pid=os.getpid(),
+                       sender_started_at=_process_start_time(os.getpid()),
+                       sender_profile_sha256=delivery_profile_sha256())
+        changed = conn.execute('UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
+                               (json.dumps(receipt), execution_id, row['delivery_receipt'])).rowcount
+        if changed != 1:
+            return None
+        return receipt
+
+
+_DELIVERY_SETTLED_STATES = ('verified', 'unknown', 'failed_certain', 'suppressed')
+# Receipt state -> delivery_outcome. In-flight states have no positive evidence yet.
+_RECEIPT_OUTCOME = {
+    'unsent': 'unknown', 'sending': 'unknown', 'unknown': 'unknown',
+    'verified': 'delivered', 'suppressed': 'suppressed', 'failed_certain': 'failed',
+}
+
+
+def _receipt_delivery_outcome(row, delivery_outcome):
+    """Receipt-derived disposition. A settled receipt is authoritative; an in-flight one
+    only fills a caller that had nothing to record."""
+    if not row or row.get('delivery_receipt') is None:
+        return delivery_outcome
+    try:
+        receipt = _decode_receipt(row)
+    except (ValueError, TypeError, KeyError):
+        return 'unknown'
+    if receipt['state'] in ('unsent', 'sending'):
+        return 'unknown'
+    return _RECEIPT_OUTCOME[receipt['state']]
+
+
+def delivery_profile_sha256() -> str:
+    """Stable identity of the profile whose execution store owns a receipt."""
+    return hashlib.sha256(str(get_hermes_home().resolve()).encode()).hexdigest()
+
+
+def _sender_incarnation_matches(receipt) -> bool:
+    """True only when the claimer's PID is still the SAME process incarnation that claimed it.
+
+    A recorded start time is what distinguishes the claimer from a later process that reused its
+    PID. A start time that no longer matches — or that either side cannot read — is not proof of
+    the original sender, so the attempt stays fenced: it never settles on an unverifiable
+    incarnation.
+    """
+    from gateway.status import start_time_fingerprints_match
+
+    recorded = receipt.get('sender_started_at')
+    current = _process_start_time(os.getpid())
+    if recorded is None or current is None:
+        return False
+    try:
+        return start_time_fingerprints_match(recorded, current, tolerance=0)
+    except (TypeError, ValueError):
+        return False
+
+
+def settle_delivery_request(
+    execution_id: str, request_sha256: str, *, attempt_nonce: str, state: str,
+    evidence: Optional[dict] = None, reason: Optional[str] = None,
+    profile_sha256: Optional[str] = None,
+) -> Optional[dict]:
+    """Settle ONE claimed attempt to a terminal receipt state, exactly once.
+
+    CAS on the exact execution id, request digest and minted attempt nonce, under the
+    owning profile. ``None`` means another writer already settled it (or the anchor
+    moved) — never a licence to send again. A late provider proof uses the same call
+    with the attempt nonce captured at claim time.
+    """
+    from cron.artifact_delivery import _hex
+
+    if state not in _DELIVERY_SETTLED_STATES:
+        raise ValueError('invalid artifact receipt state')
+    if state in ('failed_certain', 'suppressed') and evidence is not None:
+        raise ValueError('no-send disposition cannot retain acceptance evidence')
+    if state == 'failed_certain' and reason != 'gateway loop unavailable before dispatch':
+        raise ValueError('failed_certain requires proven pre-dispatch refusal')
+    if not isinstance(attempt_nonce, str) or not attempt_nonce:
+        raise ValueError('artifact settlement requires the claim attempt nonce')
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 300):
+        raise ValueError('invalid artifact settlement reason')
+    _hex(request_sha256, 64)
+    with _transaction(immediate=True) as conn:
+        row = _fetch(conn, str(execution_id))
+        if not row or not row.get('delivery_receipt'):
+            raise ValueError('artifact request anchor is missing')
+        receipt = _decode_receipt(row)
+        if receipt['request_sha256'] != request_sha256:
+            raise ValueError('artifact request digest conflict')
+        if receipt['state'] != 'sending' or receipt.get('attempt_nonce') != attempt_nonce:
+            return None
+        if (receipt.get('sender_pid') != os.getpid()
+                or receipt.get('sender_profile_sha256') != delivery_profile_sha256()
+                or profile_sha256 is not None and receipt.get('sender_profile_sha256') != profile_sha256):
+            return None
+        if not _sender_incarnation_matches(receipt):
+            return None
+        from cron.artifact_proof import evidence as validate_evidence
+
+        if state == 'verified' or evidence is not None:
+            validate_evidence(evidence, receipt)
+        receipt.update(state=state, settled_at=_hermes_now().isoformat())
+        if evidence is not None:
+            receipt['evidence'] = evidence
+        if reason is not None:
+            receipt['reason'] = reason
+        changed = conn.execute(
+            'UPDATE executions SET delivery_receipt=?, delivery_outcome=? WHERE id=? AND delivery_receipt=?',
+            (json.dumps(receipt), _RECEIPT_OUTCOME[state], row['id'], row['delivery_receipt'])).rowcount
+        if changed != 1:
+            return None
+        return receipt
+
+
+def reconcile_delivery_request(
+    execution_id: str, request_sha256: str, *, attempt_nonce: Optional[str] = None,
+    job_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Reread the receipt for one exact attempt under the owning profile — never mutates.
+
+    A dead process leaves ``sending``; that is the honest answer, not success. Identity
+    conflict raises instead of returning another attempt's receipt.
+    """
+    from cron.artifact_delivery import _hex
+
+    _hex(request_sha256, 64)
+    with _transaction() as conn:
+        row = _fetch(conn, str(execution_id))
+    if not row or not row.get('delivery_receipt'):
+        return None
+    if job_id is not None and row['job_id'] != job_id:
+        raise ValueError('artifact execution job conflict')
+    receipt = _decode_receipt(row)
+    if receipt['request_sha256'] != request_sha256:
+        raise ValueError('artifact request digest conflict')
+    if attempt_nonce is not None and receipt.get('attempt_nonce') != attempt_nonce:
+        raise ValueError('artifact attempt nonce conflict')
+    return receipt
+
+
+_PRE_DISPATCH_REFUSAL_REASONS = frozenset({
+    'artifact snapshot or path policy refused before dispatch',
+    'artifact request identity conflict before dispatch',
+    'artifact transport unavailable before dispatch',
+})
+
+
+def settle_undispatched_delivery_request(
+    execution_id: str, request_sha256: str, *, reason: str,
+) -> Optional[dict]:
+    """Settle a request proven NEVER dispatched: CAS ``unsent`` -> ``failed_certain``.
+
+    Distinct from :func:`settle_delivery_request`, which requires a claimed attempt nonce.
+    The queue sender revalidates the prepared request BEFORE the send claim, so a refusal
+    there is a proven no-send — but it still has to be durable, or its queue row could never
+    honestly read ``failed``. Only a code-owned refusal reason is accepted; an arbitrary
+    exception must never reach this state. ``None`` means another writer moved the anchor.
+    """
+    from cron.artifact_delivery import _hex
+
+    if reason not in _PRE_DISPATCH_REFUSAL_REASONS:
+        raise ValueError('failed_certain requires a proven pre-dispatch refusal')
+    _hex(request_sha256, 64)
+    with _transaction(immediate=True) as conn:
+        row = _fetch(conn, str(execution_id))
+        if not row or not row.get('delivery_receipt'):
+            return None
+        receipt = _decode_receipt(row)
+        if receipt['request_sha256'] != request_sha256:
+            raise ValueError('artifact request digest conflict')
+        if receipt['state'] != 'unsent' or receipt.get('attempt_nonce') or receipt.get('evidence'):
+            return None
+        receipt.update(state='failed_certain', reason=reason, settled_at=_hermes_now().isoformat())
+        changed = conn.execute(
+            'UPDATE executions SET delivery_receipt=?, delivery_outcome=? WHERE id=? AND delivery_receipt=?',
+            (json.dumps(receipt), _RECEIPT_OUTCOME['failed_certain'], row['id'], row['delivery_receipt'])).rowcount
+        if changed != 1:
+            return None
+        return receipt
+
+
+def execution_delivery_receipt(execution_id: str) -> Optional[dict]:
+    """Decoded durable receipt for one exact execution ID, or ``None`` — never mutates.
+
+    The queue needs this for an execution whose own payload has been redacted (its anchor is
+    gone); identity is then re-derived from the store, never from the queue row.
+    """
+    with _transaction() as conn:
+        row = _fetch(conn, str(execution_id))
+    if not row or not row.get('delivery_receipt'):
+        return None
+    return _decode_receipt(row)
+
+
+def mark_queue_admitted(execution_id: str, request_sha256: str) -> bool:
+    """Record that this exact receipt's queue row was ADMITTED, by CAS on the exact receipt.
+
+    A queue row or tombstone whose payload was later redacted carries no identity of its own, so
+    the only way to tell a row this feature wrote from a LEGACY row that happens to share the
+    execution ID is provenance the receipt itself keeps. The marker is set inside the serialized queue transaction after a validated
+    insert (or a matching pending opt-in), before that transaction commits, so a receipt that was merely prepared can
+    never adopt a legacy terminal row or tombstone. ``False`` means the anchor moved or the marker
+    was already recorded — never a licence to adopt.
+    """
+    from cron.artifact_delivery import _hex
+
+    _hex(request_sha256, 64)
+    with _transaction(immediate=True) as conn:
+        row = _fetch(conn, str(execution_id))
+        if not row or not row.get('delivery_receipt'):
+            return False
+        receipt = _decode_receipt(row)
+        if receipt['request_sha256'] != request_sha256 or receipt.get('queue_admitted') is True:
+            return False
+        receipt['queue_admitted'] = True
+        return conn.execute(
+            'UPDATE executions SET delivery_receipt=? WHERE id=? AND delivery_receipt=?',
+            (json.dumps(receipt), str(execution_id), row['delivery_receipt'])).rowcount == 1
+
+
+def get_artifact_delivery_receipt(token: str, purpose: str, *, expected_request_sha256=None) -> Optional[dict]:
+    from cron.artifact_delivery import _hex
+
+    _hex(token, 32)
+    if purpose not in ('report', 'review'):
+        raise ValueError('invalid artifact purpose')
+    if expected_request_sha256 is not None:
+        _hex(expected_request_sha256, 64)
+    with _transaction() as conn:
+        receipts = [_decode_receipt(row) for row in _receipt_records(conn, purpose + ':' + token)]
+    if not receipts:
+        return None
+    if len({receipt['request_sha256'] for receipt in receipts}) != 1:
+        raise ValueError('conflicting artifact receipt identities')
+    active = [receipt for receipt in receipts if receipt['state'] != 'failed_certain']
+    if len(active) > 1:
+        raise ValueError('duplicate active artifact receipts')
+    receipt = active[0] if active else receipts[0]
+    if expected_request_sha256 is not None and receipt['request_sha256'] != expected_request_sha256:
+        raise ValueError('artifact receipt request digest conflict')
+    return receipt

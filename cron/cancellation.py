@@ -15,6 +15,7 @@ for can read it, so a cancel can never bleed into the job's next fire.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import tempfile
 import time
@@ -24,6 +25,8 @@ from typing import Any, Dict, Optional, Protocol
 from hermes_constants import get_hermes_home
 
 from cron.executions import cancellable_execution
+
+logger = logging.getLogger(__name__)
 
 # A marker whose run was SIGKILLed before it could clean up is unreadable garbage. Canceling a
 # job is rare, so the prune rides along with the write instead of needing its own sweep.
@@ -206,6 +209,8 @@ def run_job_unless_cancelled(run_job, job, run_kwargs, teardown, fence, executio
     its claim, and the run must book the cancel, not "fire claim ownership lost" (#123045).
     ``run_job`` hands the agent back even when raising, so ``teardown`` runs on every path
     (BaseException, so KeyboardInterrupt/SystemExit mid-run still tear down)."""
+    from cron.consumer_run_lock import release_unstarted_fire
+
     try:
         result = run_job(job, **run_kwargs)
     except BaseException as exc:
@@ -213,6 +218,31 @@ def run_job_unless_cancelled(run_job, job, run_kwargs, teardown, fence, executio
         if not (isinstance(exc, Exception) and fence.operator_cancelled()):
             raise
         finish_cancelled_run(job, execution_id, fire_owner)
+        return None
+    if job.get("_consumer_refusal"):
+        # A consumer refusal from the canonical owner: nothing ran, so this fire is booked as an
+        # unstarted run through its own owner-fenced claims — never a failure, delivery or incident.
+        from cron.executions import give_up_execution, settle_unstarted_execution
+
+        claim = job.get("fire_claim")
+        try:
+            release_unstarted_fire(
+                str(job.get("id") or ""), str(claim.get("by") or "") if isinstance(claim, dict) else "",
+                expected_manual_run_at=job.get("manual_run_at"),
+                expected_run_claim=job.get("run_claim"))
+            settle_unstarted_execution(str(execution_id), str(job.get("id") or ""),
+                                       str(job["_consumer_refusal"]))
+        except Exception as exc:
+            # A cleanup failure must NOT reach the crash tail: that would alert, mark the job failed
+            # and consume the manual request / finite occurrence for a fire that computed nothing.
+            # The journal this fire wrote is the durable receipt, so the attempt is relinquished as
+            # given-up and the next reconciliation replays the same owner-fenced cleanup.
+            logger.warning(
+                "Job '%s': unstarted cleanup failed (%s); receipt recovery will replay it",
+                job.get("id"), exc, exc_info=True)
+            give_up_execution(str(execution_id),
+                              reason=f"unstarted cleanup failed: {type(exc).__name__}: {exc}")
+            return None
         return None
     if not fence.operator_cancelled():
         return result

@@ -26,6 +26,13 @@ from gateway.platforms._shared import (
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
     platform_gate_env as _scoped_gate_env,
 )
+from plugins.platforms.telegram import adapter_delivery as _delivery
+from plugins.platforms.telegram.adapter_media_probe import (
+    _coerce_duration_seconds,
+    _probe_video_geometry,
+    _probe_voice_duration_seconds,
+    _video_thumbnail_jpeg,
+)
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -215,116 +222,6 @@ def _flood_cap_result(wait: float) -> SendResult:
 
 _TELEGRAM_IMAGE_MIME_TO_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
 _TELEGRAM_IMAGE_EXT_TO_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
-
-
-def _coerce_duration_seconds(value: Any) -> Optional[int]:
-    """Round a raw length to whole positive seconds, or None if unusable."""
-    try:
-        secs = round(float(value))
-    except (TypeError, ValueError):
-        return None
-    return secs if secs > 0 else None
-
-
-def _probe_voice_duration_seconds(path: str) -> Optional[int]:
-    """Best-effort whole-second audio length (wave → mutagen → ffprobe; None if unreadable).
-
-    Telegram renders long clips as 0:00 without an explicit duration. Blocking: use ``to_thread``."""
-    if os.path.splitext(path)[1].lower() == ".wav":
-        try:
-            import wave
-            with wave.open(path, "rb") as wf:
-                rate = wf.getframerate() or 0
-                secs = _coerce_duration_seconds(wf.getnframes() / float(rate)) if rate else None
-            if secs is not None:
-                return secs
-        except Exception:
-            pass
-    try:
-        import mutagen
-        secs = _coerce_duration_seconds(getattr(getattr(mutagen.File(path), "info", None), "length", None))
-        if secs is not None:
-            return secs
-    except Exception:
-        pass
-    try:
-        import shutil
-        import subprocess
-        if shutil.which("ffprobe"):
-            proc = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path],
-                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, check=False)
-            if proc.returncode == 0:
-                return _coerce_duration_seconds(proc.stdout.strip())
-    except Exception:
-        pass
-    return None
-
-
-def _probe_video_geometry(path: str) -> dict[str, int]:
-    """``{"width", "height", "duration"}`` for a local video; ``{}`` when ffprobe can't read it.
-
-    Telegram runs its own video processing only for uploads under roughly 10 MB; above that it
-    stores the file as an unprocessed ``320x320`` video with ``duration=0``, so the message must
-    carry the real geometry or clients draw a square tile for any aspect ratio.
-    """
-    try:
-        import shutil
-        import subprocess
-        if not shutil.which("ffprobe"):
-            return {}
-        proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-show_entries", "format=duration",
-             "-of", "json", path],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, check=False)
-        if proc.returncode != 0:
-            return {}
-        blob = json.loads(proc.stdout or "{}")
-        streams = blob.get("streams") or []
-        if not streams:
-            return {}
-        geometry = {"width": int(streams[0]["width"]), "height": int(streams[0]["height"])}
-        duration = _coerce_duration_seconds((blob.get("format") or {}).get("duration"))
-        if duration:
-            geometry["duration"] = duration
-        return geometry
-    except Exception:
-        logger.debug("[Telegram] video geometry probe failed for %s", path, exc_info=True)
-        return {}
-
-
-def _video_thumbnail_jpeg(path: str, duration: Optional[int]) -> Optional[str]:
-    """Write a 320px-wide JPEG frame for Telegram's ``thumbnail`` field; None on failure.
-
-    Telegram keeps a supplied thumbnail for the uploads it did not process itself — without one the
-    chat shows a square placeholder tile until the video is opened.
-    """
-    out = None
-    try:
-        import shutil
-        import subprocess
-        import tempfile
-        if not shutil.which("ffmpeg"):
-            return None
-        seek = max(1, int((duration or 3) * 0.25))
-        fd, out = tempfile.mkstemp(suffix=".jpg", prefix="hermes-tg-thumb-")
-        os.close(fd)
-        proc = subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(seek), "-i", path, "-frames:v", "1",
-             "-vf", "scale=320:-2", "-q:v", "6", out],
-            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30, check=False)
-        if proc.returncode != 0 or not os.path.getsize(out):
-            with contextlib.suppress(OSError):
-                os.remove(out)
-            return None
-        return out
-    except Exception:
-        logger.debug("[Telegram] video thumbnail extraction failed for %s", path, exc_info=True)
-        if out:
-            with contextlib.suppress(OSError):
-                os.remove(out)
-        return None
 
 
 def telegram_deps_present() -> bool:
@@ -1528,7 +1425,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             message_id = getattr(msg, "message_id", None)
         if message_id is not None:
             await self._record_rich_sent(chat_id, message_id, content)
-        return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
+        raw_response = None
+        if message_id is not None:
+            # One raw API request = one chunk; the receipt hashes the EXACT rich payload.
+            raw_response = {"delivery_receipt": _delivery.rich_notification_proof(
+                content, payload, chat_id, thread_id, message_id)}
+        return SendResult(
+            success=True, message_id=str(message_id) if message_id is not None else None,
+            raw_response=raw_response)
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "rich_message": self._rich_message_payload(content)}
@@ -3479,23 +3383,30 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             _TimedOut = None  # type: ignore[assignment,misc]
         return _NetErr, _BadReq, _TimedOut
 
-    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any]):
+    async def _send_chunk_markdown_or_plain(self, chunk: str, send_kwargs: dict[str, Any], submitted=None):
         """MarkdownV2 first; on a parse/markdown rejection resend as stripped plain text."""
+        text = chunk
         try:
-            return await _await_with_thread_deadline(
-                self._bot.send_message(text=chunk, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
+            msg = await _await_with_thread_deadline(
+                self._bot.send_message(text=text, parse_mode=ParseMode.MARKDOWN_V2, **send_kwargs),
                 timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
         except Exception as md_error:
-            if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                return await _await_with_thread_deadline(
-                    self._bot.send_message(text=_strip_mdv2(chunk), parse_mode=None, **send_kwargs),
-                    timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
-            raise
+            if "parse" not in str(md_error).lower() and "markdown" not in str(md_error).lower():
+                raise
+            logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
+            text = _strip_mdv2(chunk)
+            msg = await _await_with_thread_deadline(
+                self._bot.send_message(text=text, parse_mode=None, **send_kwargs),
+                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+        if submitted is not None:
+            submitted.append({"sha256": _delivery.sha256_hex(text.encode("utf-8")),
+                              "thread_id": send_kwargs.get("message_thread_id")
+                              or send_kwargs.get("direct_messages_topic_id")})
+        return msg
 
     async def _send_chunk_with_retries(
         self, chat_id: str, chunk: str, index: int, reply_to: Optional[str], metadata: Optional[dict[str, Any]],
-        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple):
+        thread_id: Optional[str], used_thread_fallback: bool, error_types: tuple, submitted=None):
         """Deliver one chunk: routing, up to 3 attempts, thread-not-found / deleted-anchor / flood handling.
 
         Returns ``(msg, used_thread_fallback)`` on success or a ``SendResult`` to return verbatim (fail-loud DM-topic
@@ -3516,7 +3427,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
                     **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
+                return await self._send_chunk_markdown_or_plain(chunk, send_kwargs, submitted), used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
@@ -3699,7 +3610,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
                     _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
                     for chunk in chunks
                ]
-            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
+            return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types,
+                                           incoming=content)
         except Exception as e:
             classified = self._classify_send_exception(e, error_types)
             return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
@@ -3725,28 +3637,52 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def _send_chunks(
         self, chat_id: str, chunks: list[str], delivered: list[str], reply_to: Optional[str],
-        metadata: Optional[dict[str, Any]], error_types: tuple) -> SendResult:
+        metadata: Optional[dict[str, Any]], error_types: tuple, incoming: Optional[str] = None,
+    ) -> SendResult:
         """Deliver formatted ``chunks`` in order, appending each landed message id to ``delivered``
         (pre-seeded with the ids of an earlier partial send when resuming — the chunk index used for
-        reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result."""
+        reply routing continues from there). A mid-loop refusal returns the ``partial_overflow`` result.
+
+        ``incoming`` (the exact text handed to :meth:`_send_text_locked`) adds provider acceptance
+        evidence to ``raw_response["delivery_receipt"]``: the incoming digest plus every submitted
+        chunk's index/hash/message id. Callers without it keep the legacy shape.
+        """
         thread_id = self._metadata_thread_id(metadata)
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
         prior = len(delivered)
+        chunk_proof: list[dict[str, Any]] = []
+        submitted = [] if incoming is not None else None
         for chunk in chunks:
+            index = len(delivered)
             outcome = await self._send_chunk_with_retries(
-                chat_id, chunk, len(delivered), reply_to, metadata, thread_id, used_thread_fallback, error_types)
+                chat_id, chunk, index, reply_to, metadata, thread_id, used_thread_fallback, error_types,
+                submitted=submitted)
             if isinstance(outcome, SendResult):
                 # Every SendResult returned here is a DEFINITE non-delivery (flood cap, DM-topic refusal);
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
                 return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
             msg, used_thread_fallback = outcome
+            if not _delivery.valid_message_id(msg.message_id):
+                return self._with_partial_send(
+                    SendResult(success=False, error="Provider acceptance missing message id", retryable=False),
+                    chunks[len(delivered) - prior:], delivered, tail_certain=False)
             delivered.append(str(msg.message_id))
+            chunk_proof.append({"index": index, "sha256": submitted[-1]["sha256"] if submitted else "",
+                                "message_id": str(msg.message_id)})
         await self._retrigger_typing(chat_id, metadata)
+        raw_response: dict[str, Any] = {
+            "message_ids": list(delivered), "requested_thread_id": requested_thread_id,
+            "thread_fallback": used_thread_fallback}
+        if (incoming is not None and len(chunk_proof) == len(chunks) and not used_thread_fallback
+                and len(submitted) == len(chunks) and all(
+                    (str(item["thread_id"]) if item["thread_id"] is not None else None)
+                    == (str(thread_id) if thread_id is not None else None) for item in submitted)):
+            raw_response["delivery_receipt"] = _delivery.chunked_notification_proof(
+                incoming, chunk_proof, chat_id, thread_id)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
-            raw_response={
-                "message_ids": list(delivered), "requested_thread_id": requested_thread_id, "thread_fallback": used_thread_fallback})
+            raw_response=raw_response)
 
     @staticmethod
     def _with_partial_send(
@@ -5365,19 +5301,34 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def _send_local_file(
         self, label: str, path: str, chat_id, reply_to, metadata, media_key: str, build_kwargs, on_error,
+        snapshot: Optional[bytes] = None,
     ) -> SendResult:
         """Shared shell for native local-file sends: existence check, open, send with routing, then
-        ``await on_error(exc)`` on any failure. ``build_kwargs(f)`` supplies the media kwargs."""
+        ``await on_error(exc)`` on any failure. ``build_kwargs(f)`` supplies the media kwargs.
+
+        ``snapshot`` (opt-in contract) uploads THESE exact bytes instead of reopening ``path``, so a
+        file that changed after validation cannot substitute later bytes; the successful native
+        message id carries the snapshot's full digest as ``raw_response["delivery_receipt"]``. Any
+        failure — including the text fallback — returns without that proof.
+        """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
         try:
-            if not os.path.exists(path):
+            handle = _delivery.open_upload_source(path, snapshot)
+            if handle is None:
                 return SendResult(success=False, error=self._missing_media_path_error(label, path))
-            with open(path, "rb") as f:  # noqa: ASYNC230 -- file handle is streamed to the upload; a local open() is non-blocking in practice
+            with handle as f:
                 msg = await self._send_media(
                     getattr(self._bot, f"send_{media_key}"), chat_id, reply_to, metadata, media_key,
                     reset_media=lambda: f.seek(0), **build_kwargs(f))
-            return SendResult(success=True, message_id=str(msg.message_id))
+            raw_response = None
+            if snapshot is not None:
+                raw_response = {"delivery_receipt": _delivery.document_proof(
+                    snapshot, chat_id, getattr(msg, "message_thread_id", None), msg.message_id,
+                    media_key)}
+                if raw_response["delivery_receipt"] is None:
+                    return SendResult(success=False, error="Provider acceptance missing message id", retryable=False)
+            return SendResult(success=True, message_id=str(msg.message_id), raw_response=raw_response)
         except Exception as e:
             return await on_error(e)
 
@@ -5387,15 +5338,21 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
-        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
-        """Send a document/file natively as a Telegram file attachment."""
+        reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
+        snapshot: Optional[bytes] = None, **kwargs) -> SendResult:
+        """Send a document/file natively as a Telegram file attachment.
+
+        ``snapshot`` uploads the caller's immutable bytes (opt-in artifact contract); the path is
+        then only a display name. The base-class text fallback never carries the native proof.
+        """
         return await self._send_local_file(
             "File", file_path, chat_id, reply_to, metadata, "document",
             lambda f: {"document": f, "filename": file_name or os.path.basename(file_path), "caption": self._caption_1024(caption)},
             lambda e: self._warn_then(
                 "document", e, super(
                     TelegramAdapter, self,
-                ).send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
+                ).send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)),
+            snapshot=snapshot)
 
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,

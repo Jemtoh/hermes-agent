@@ -30,7 +30,7 @@ def finish_interrupted_run(job, execution_id, delivery_error):
 def _classify_delivery_outcome(
     *, delivery_error, should_deliver: bool, unresolved_origin: bool,
     normalized_deliver: str, incident_acked: bool, success: bool,
-    delivery_queued=None, notification_suppressed: bool = False,
+    delivery_queued=None, delivery_unverified=None, notification_suppressed: bool = False,
 ) -> str:
     if delivery_error:
         return "failed"
@@ -41,7 +41,7 @@ def _classify_delivery_outcome(
     if should_deliver and unresolved_origin:
         return "not_configured"
     if should_deliver and normalized_deliver != "local":
-        return "delivered"
+        return "unverified" if delivery_unverified else "delivered"
     if incident_acked and not success:
         # Failure ping withheld for a known signature: operator acked it, or it was already
         # alerted inside the reminder cooldown (vs. plain "suppressed").
@@ -95,6 +95,7 @@ def finish_completed_run(d, fire_owner: Optional[str], execution_id: str, *, rec
     delivery_outcome = _classify_delivery_outcome(
         delivery_error=d.delivery_error,
         delivery_queued=job.get("last_delivery_queued"),
+        delivery_unverified=job.get("last_delivery_unverified"),
         notification_suppressed=bool(job.get("_notification_all_targets_suppressed")),
         should_deliver=d.should_deliver,
         unresolved_origin=d.unresolved_origin,

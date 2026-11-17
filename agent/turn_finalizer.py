@@ -727,6 +727,14 @@ def finalize_turn(
         if final_response and not interrupted:
             _raw = final_response
             final_response, _, _ = apply_llm_output_transform(agent, final_response, turn_id=turn_id, logger=logger)
+            # Recovery-only visible text (stream-recovered / prior-turn content) reaches
+            # here with no producer-side normalization; the tail close below writes it as
+            # the durable row, so normalize at this existing seam or the row and the
+            # returned answer can differ by exactly the redaction the producer applies.
+            # The normal text turn was already normalized before its flush, so this is
+            # idempotent there.
+            from agent.chat_completion_helpers import normalize_assistant_text
+            final_response = normalize_assistant_text(agent, final_response) or ""
             _store_rewrite_on_tail(agent, messages, _raw, final_response)
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed and not vetoed:

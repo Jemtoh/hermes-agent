@@ -103,6 +103,27 @@ def _absorb_continuation_fragments(final_response: Any, parts: Any, messages: An
     return _join_truncated_parts([*parts, (final_response, False)]), True
 
 
+def _store_visible_final(agent, final_msg, final_response, *, promoted, joined, transformed):
+    """Store this turn's visible bytes and return the delivered text (T1 rules)."""
+    if transformed:
+        if promoted:
+            final_msg["api_content"] = final_response
+        else:
+            final_msg["content"] = final_response
+    if promoted:
+        from agent.chat_completion_helpers import normalize_assistant_text
+        final_response = normalize_assistant_text(agent, final_response) or ""
+        final_msg["api_content"] = final_response
+        return final_response
+    from agent.chat_completion_helpers import normalize_assistant_text
+    final_response = normalize_assistant_text(agent, final_response) or ""
+    if joined and not transformed:
+        final_msg["content"] = normalize_assistant_text(agent, final_msg.get("content")) or ""
+    else:
+        final_msg["content"] = final_response
+    return final_response
+
+
 def finish_text_response(
     agent: Any, *, assistant_message: Any, response: Any, finish_reason: Any, messages: Any,
     api_messages: Any, conversation_history: Any, api_call_count: Any, user_message: Any,
@@ -394,11 +415,9 @@ def finish_text_response(
         final_response, _transformed, _ = apply_llm_output_transform(
             agent, final_response, turn_id=getattr(agent, "_current_turn_id", "") or "", logger=logger,
         )
-    if _transformed:
-        if _promoted:
-            final_msg["api_content"] = final_response
-        else:
-            final_msg["content"] = final_response
+    final_response = _store_visible_final(
+        agent, final_msg, final_response,
+        promoted=_promoted, joined=_joined, transformed=_transformed)
     publish_held_final_row(agent, final_msg, final_response, _joined)
 
     append_message(messages, final_msg)

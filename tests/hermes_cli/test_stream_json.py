@@ -42,6 +42,25 @@ def test_emitter_event_stream_is_valid_jsonl(capsys):
     assert all("timestamp" in e for e in events)
 
 
+@pytest.mark.parametrize("text", [
+    "Ordinary final text with no secrets.",
+    "AUTHORIZATION: CONTRACT \u00a71 remains binding.",
+    "Review complete; key=*** (already masked by the producer).",
+])
+def test_the_terminal_result_carries_the_producers_bytes_unchanged(capsys, text):
+    """The emitter is a transport, not a second normalizer.
+
+    Whatever the producer stored and returned is what the terminal record carries:
+    a second masking pass here would make the delivered bytes differ from the row the
+    pre-write consumer hashes.
+    """
+    emitter = StreamJsonEmitter(model="test-model", session_id="s-1")
+    emitter.emit_result({"final_response": text}, session_id="s-1")
+
+    terminal = [event for event in _events(capsys) if event["type"] == "result"][-1]
+    assert terminal["text"] == text
+
+
 def _run_stream_json_chat(monkeypatch, capsys, run_turn, credentials_ok=True):
     """parser → cmd_chat → gateway transport with a deterministic fake authority peer.
 
@@ -135,3 +154,28 @@ def test_chat_stream_json_rejects_interactive_combinations(monkeypatch, capsys, 
         cli_entry.cmd_chat(parser.parse_args(argv))
     assert exc_info.value.code == 2
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('raw', [
+    'Ordinary non-portfolio response.',
+    'Answer. Authorization: Bearer sk-invented-not-a-live-key-0123456789'])
+def test_real_producer_reaches_terminal_without_raw_credentials(tmp_path, monkeypatch, capsys, raw):
+    from tests.agent.test_empty_response_recovery_persistence import real_loop, _response
+    from agent import redact
+    monkeypatch.setattr(redact, '_REDACT_ENABLED', True)
+    fixture = real_loop.__wrapped__(tmp_path, monkeypatch)
+    loop = next(fixture)
+    try:
+        loop.agent.skip_background_review = True
+        result = loop.run([_response(raw)], 'Answer an invented general question.')
+        assert result['completed'] is True
+        stored = [r['content'] for r in loop.db.get_messages(loop.sid) if r['role']=='assistant'][-1]
+        capsys.readouterr()
+        StreamJsonEmitter(model='invented',session_id=loop.sid).emit_result(result,session_id=loop.sid)
+        terminal = [e for e in _events(capsys) if e['type']=='result'][-1]
+        assert terminal['text'] == stored
+        assert 'sk-invented-not-a-live-key-0123456789' not in terminal['text']
+        if raw.startswith('Ordinary'):
+            assert stored == raw
+    finally:
+        next(fixture, None)

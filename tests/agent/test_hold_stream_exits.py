@@ -19,6 +19,15 @@ from tests.fakes.redactor_plugin import COMMENTARY, RAW, REWRITE, redactor_home
 
 ATTEMPT = "Done, the deploy key SECRET-321 is in place."
 
+# A held rewrite that itself carries a credential: the transform output is the
+# user's answer, so the producer's masking has to reach it too.
+_HELD_LEAK_REWRITE = r'''
+def register(ctx):
+    def _rewrite(response_text, **_):
+        return response_text + "\nbackup sk-invented-not-a-live-key-0123456789"
+    ctx.register_hook("transform_llm_output", _rewrite, hold_stream=True)
+'''
+
 
 def _agent(server, db, session_id: str, **kwargs):
     from run_agent import AIAgent
@@ -181,3 +190,17 @@ def test_codex_commentary_riding_a_held_final_stays_out_of_history(held):
     # The provider items stay on the row for replay; no rendered field carries the commentary.
     rendered = [row.get(key) for row in displayed for key in ("text", "display_content", "display_commentary")]
     assert COMMENTARY not in str(rendered)
+
+
+def test_a_held_rewrite_is_masked_in_both_the_answer_and_the_stored_row(held):
+    """The transform output becomes the user's answer, so it gets the same masking.
+
+    A held turn's rewrite used to reach the row and the caller raw: the plugin's text
+    was never seen by the producer's normalization, so a credential it introduced
+    survived in both places.
+    """
+    result, shown, displayed, _, _ = held([Text(RAW)], plugin_body=_HELD_LEAK_REWRITE)
+    assert shown == []  # the hold still holds: nothing leaves before the rewrite
+    assert "sk-invented-not-a-live-key-0123456789" not in result["final_response"]
+    assert "Keep them safe." in result["final_response"]
+    assert _assistant_texts(displayed) == [result["final_response"]]

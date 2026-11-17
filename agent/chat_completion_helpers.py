@@ -1572,18 +1572,18 @@ def _assistant_reasoning_text(agent, assistant_message) -> Optional[str]:
     return _sanitize_surrogates(reasoning_text) if reasoning_text else reasoning_text
 
 
+def normalize_assistant_text(agent, content) -> Optional[str]:
+    """Stored-and-delivered visible text: surrogates, think blocks, redaction."""
+    content = _sanitize_surrogates(flatten_message_text(content))
+    if not (isinstance(content, str) and content):
+        return content
+    from agent.agent_runtime_helpers import strip_think_blocks
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(strip_think_blocks(agent, content).strip())
+
+
 def _assistant_content_for_storage(agent, assistant_message):
-    # Sanitize surrogates (Kimi/GLM via Ollama emit code points that crash json.dumps),
-    # strip inline <think> tags at the storage boundary (they leaked to platforms and
-    # polluted titles), then redact inlined credentials before the message enters
-    # history / state.db / gateway delivery (no-op with HERMES_REDACT_SECRETS off).
-    content = _sanitize_surrogates(flatten_message_text(getattr(assistant_message, "content", None)))
-    if isinstance(content, str) and content:
-        content = agent._strip_think_blocks(content).strip()
-        if content:
-            from agent.redact import redact_sensitive_text
-            content = redact_sensitive_text(content)
-    return content
+    return normalize_assistant_text(agent, getattr(assistant_message, "content", None))
 
 
 def _assistant_tool_call_dict(agent, tool_call, index: int) -> dict:

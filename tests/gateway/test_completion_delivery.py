@@ -508,6 +508,24 @@ def test_coalesced_format_bounds_details_and_reports_omitted_count():
     assert "and 2 more completion(s)" in text
 
 
+def test_coalesced_format_delivers_ordinary_text_verbatim_and_masks_a_credential():
+    """The delivery formatter is not a second producer: ordinary text survives, and a
+    credential the producer masked never reappears in raw form on the way out."""
+    ordinary = "Ordinary completion output.\nsecond line"
+
+    async def _format(output):
+        loop = asyncio.get_running_loop()
+        first = _completion_event(started_at=1.0, session_id="proc_delivery")
+        first["output"] = output
+        return GatewayRunner._format_coalesced_process_completions([
+            ("first", first, loop.create_future()),
+        ])
+
+    assert ordinary in asyncio.run(_format(ordinary))
+    masked = asyncio.run(_format("Review complete; key=*** and rule intact."))
+    assert "Review complete; key=*** and rule intact." in masked
+
+
 def test_coalesced_format_force_redacts_output_when_redaction_disabled(monkeypatch):
     """A user setting cannot disable the gateway's outbound secret floor."""
     import agent.redact as redact_module
@@ -1003,3 +1021,34 @@ def test_watch_drain_retries_transport_failure(monkeypatch, isolated_registry):
     asyncio.run(runner._async_delegation_watcher(interval=0))
     assert adapter.handle_message.await_count == 2
     assert isolated_registry.completion_queue.empty()
+
+
+@pytest.fixture(name="producer_loop")
+def _producer_loop(tmp_path, monkeypatch):
+    from tests.agent.test_empty_response_recovery_persistence import real_loop
+    fixture = real_loop.__wrapped__(tmp_path, monkeypatch)
+    loop = next(fixture)
+    try:
+        yield loop
+    finally:
+        next(fixture, None)
+
+
+@pytest.mark.parametrize('raw', [
+    'Ordinary non-portfolio response.',
+    'Answer. Authorization: Bearer sk-invented-not-a-live-key-0123456789'])
+def test_real_producer_bytes_reach_gateway_chat_boundary(producer_loop, monkeypatch, raw):
+    from agent import redact
+    from tests.agent.test_empty_response_recovery_persistence import _response
+    from gateway.run import _sanitize_gateway_final_response
+    monkeypatch.setattr(redact, '_REDACT_ENABLED', True)
+    producer_loop.agent.skip_background_review = True
+    result = producer_loop.run([_response(raw)], 'Answer an invented general question.')
+    assert result['completed'] is True
+    stored = [row['content'] for row in producer_loop.db.get_messages(producer_loop.sid)
+              if row['role'] == 'assistant'][-1]
+    delivered = _sanitize_gateway_final_response(Platform.TELEGRAM, result['final_response'])
+    assert delivered == stored
+    assert 'sk-invented-not-a-live-key-0123456789' not in delivered
+    if raw.startswith('Ordinary'):
+        assert delivered == raw

@@ -43,6 +43,21 @@ class TestWriteUsageFile:
         assert "failure" not in report
 
 
+    @pytest.mark.parametrize(
+        ("served", "expected"),
+        [("provider/actual-model", "provider/actual-model"), (None, None),
+         ("https://internal.invalid/inference", None)],
+    )
+    def test_receipt_distinguishes_requested_route_and_served_model(self, tmp_path, served, expected):
+        path = tmp_path / "usage.json"
+        _write_usage_file(str(path), _result(
+            model="route-alias", requested_model="requested-model", served_model=served,
+        ))
+        report = json.loads(path.read_text())
+        assert report["model"] == "route-alias"
+        assert report["requested_model"] == "requested-model"
+        assert report["served_model"] == expected
+
     def test_failure_marks_failed_and_records_message(self, tmp_path):
         path = tmp_path / "usage.json"
         _write_usage_file(str(path), {}, failure="boom")

@@ -32,6 +32,7 @@ _USAGE_KEYS = (
     "estimated_cost_usd", "cost_status", "cost_source", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "total_tokens", "api_calls",
     "model", "provider", "session_id", "completed", "partial", "interrupted", "turn_exit_reason",
+    "requested_model",
 )
 
 # Counters summed per auxiliary task (vision, compression, title_generation, ...) into the
@@ -222,6 +223,10 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         return
     try:
         report = {key: result.get(key) for key in _USAGE_KEYS}
+        # The runtime also accepts a proxy's upstream endpoint as a display
+        # hint. An endpoint is not a model ID and may contain private routing data.
+        served = result.get("served_model")
+        report["served_model"] = served if isinstance(served, str) and served.strip() and "://" not in served else None
         report["failed"] = bool(result.get("failed")) or failure is not None
         report["service_tier"] = result.get("service_tier")
         if isinstance(result.get("auxiliary_usage"), dict):
